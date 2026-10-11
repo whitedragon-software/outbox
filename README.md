@@ -12,6 +12,8 @@ https://outbox.<username>.workers.dev/
 - `_worker.js`: the Worker. Deploy this file as-is; no build step, no
   dependencies, no schema to run — it creates its own database table on
   first use.
+- `wrangler.jsonc`: config for CLI deploys only. The dashboard route needs
+  none of it.
 - `CHANGELOG.md`: what changed in each build.
 
 ---
@@ -24,20 +26,26 @@ under Settings the variables `RESEND_KEY` (as an encrypted secret) and
 `DOMAIN1` (plain text), and a D1 binding named `DB`. Done — no config file,
 no CLI. The free tier is enough.
 
-Or deploy from the command line with a minimal `wrangler.toml`:
+Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 
-```toml
-name = "outbox"
-main = "_worker.js"
-compatibility_date = "2024-09-01"
-
-[vars]
-DOMAIN1 = "yourdomain.com"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "email-db"
-database_id = "<your-database-id>"
+```jsonc
+{
+  "name": "outbox",
+  "main": "_worker.js",
+  "compatibility_date": "2024-09-01",
+  "vars": {
+    // must be a domain verified in Resend
+    "DOMAIN1": "yourdomain.com"
+  },
+  "d1_databases": [
+    {
+      // the binding must be named DB; the database can be called anything
+      "binding": "DB",
+      "database_name": "email-db",
+      "database_id": "<your-database-id>"
+    }
+  ]
+}
 ```
 
 ```
@@ -45,8 +53,11 @@ npx wrangler secret put RESEND_KEY
 npx wrangler deploy
 ```
 
-`DOMAIN1` must be a domain verified in Resend (Domains tab); the binding
-must be named `DB`, the database itself can be called anything.
+Wrangler picks up `wrangler.jsonc` automatically — no flag needed. If you
+ever have both a `wrangler.toml` and a `wrangler.jsonc` in the folder,
+delete one, or Wrangler will complain about the ambiguity.
+
+`DOMAIN1` must be a domain verified in Resend (Domains tab).
 
 ### Optional: token protection
 
