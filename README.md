@@ -9,52 +9,67 @@ provider's.
 https://outbox.<username>.workers.dev/
 ```
 
-- `src/index.js`: the Worker. Every page, endpoint and query lives in this
-  one file; no build step, no dependencies.
-- `wrangler.toml`: worker name, `DOMAIN1`, the D1 binding.
-- `schema.sql`: reference copy of the table. Optional — the Worker creates
-  and migrates the table automatically on first use.
+- `_worker.js`: the Worker. Deploy this file as-is; no build step, no
+  dependencies, no schema to run — it creates its own database table on
+  first use.
+- `CHANGELOG.md`: what changed in each build.
 
 ---
 
 ## Deploy
 
+Paste `_worker.js` into the Worker editor in the Cloudflare dashboard:
+create a Worker, replace the boilerplate with the file's contents, then add
+under Settings the variables `RESEND_KEY` (as an encrypted secret) and
+`DOMAIN1` (plain text), and a D1 binding named `DB`. Done — no config file,
+no CLI. The free tier is enough.
+
+Or deploy from the command line with a minimal `wrangler.toml`:
+
+```toml
+name = "outbox"
+main = "_worker.js"
+compatibility_date = "2024-09-01"
+
+[vars]
+DOMAIN1 = "yourdomain.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "email-db"
+database_id = "<your-database-id>"
 ```
-wrangler deploy
+
+```
+npx wrangler secret put RESEND_KEY
+npx wrangler deploy
 ```
 
-or paste `src/index.js` into the Worker editor in the Cloudflare dashboard.
-The free tier is enough.
-
-Required configuration:
-
-| Name | Kind | Purpose |
-|---|---|---|
-| `RESEND_KEY` | secret (`wrangler secret put RESEND_KEY`) | Resend API key. |
-| `DOMAIN1` | var | The verified sending domain, e.g. `mydomain.com`. |
-| `DB` | D1 binding | Send history. Any name for the database; the binding must be `DB`. |
+`DOMAIN1` must be a domain verified in Resend (Domains tab); the binding
+must be named `DB`, the database itself can be called anything.
 
 ### Optional: token protection
 
 Set an `AUTH_TOKEN` secret and every page and endpoint requires it:
 
 ```
-wrangler secret put AUTH_TOKEN
+npx wrangler secret put AUTH_TOKEN
 ```
 
-**Unset, Outbox behaves exactly as before.**
+(or add `AUTH_TOKEN` as a secret in the dashboard). **Unset, Outbox behaves
+exactly as before.**
 
 | Path | Purpose |
 |---|---|
-| `/` | Compose form. Open as `/?token=...` when a token is set. |
+| `/` | Compose form. Open as `/?token=…` when a token is set. |
 | `/sent` | History, newest first; click a message to expand the full body. |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
 | `POST /send` | JSON API. Send the token in the `X-Auth-Token` header. |
 | `POST /usage/sync` | Refresh delivery details for the 25 most recent sends. |
 
-Pages take the token via `?token=`; the form and dashboard then pass it along
-in the `X-Auth-Token` header automatically, so links between pages keep
-working.
+Pages take the token via `?token=`; the form and dashboard then pass it
+along in the `X-Auth-Token` header automatically, so links between pages
+keep working.
 
 ---
 
@@ -113,7 +128,7 @@ read `DOMAIN` and `TOKEN` from Worker-side interpolations.
 
 ---
 
-## Editing and verifying `src/index.js`
+## Editing and verifying `_worker.js`
 
 The page scripts live inside template literals, so **`node --check` on the
 outer file does not validate them.** A syntax error in an inline script
@@ -121,11 +136,11 @@ kills that page in the browser while the Worker still deploys clean. The
 outer file is also an ES module, so check it as `.mjs`. Always run both:
 
 ```
-cp src/index.js .check.mjs && node --check .check.mjs && rm .check.mjs
+cp _worker.js .check.mjs && node --check .check.mjs && rm .check.mjs
 
 python3 - << 'PY'
 import re
-src = open('src/index.js').read()
+src = open('_worker.js').read()
 scripts = re.findall(r'<script>\n(.*?)</script>', src, re.DOTALL)
 for i, s in enumerate(scripts):
     s = re.sub(r'\$\{[^}]*\}', 'null', s)
@@ -155,7 +170,7 @@ them with `null` before checking.
 5. Break something on purpose: an unverified domain or bad key shows the
    real Resend error in the form, and the failed attempt is logged in
    `/sent` with a red dot.
-6. With `AUTH_TOKEN` set: `/` without a token returns 401; `/?token=...`
+6. With `AUTH_TOKEN` set: `/` without a token returns 401; `/?token=…`
    loads and the send button still works; `/sent` and `/usage` follow the
    links without losing the token.
 7. Missing `RESEND_KEY` or `DOMAIN1`: a plain-text configuration error,
@@ -168,7 +183,7 @@ them with `null` before checking.
 - **Without `AUTH_TOKEN`, anyone with the URL can send email from your
   domain through your key.** There is no rate limiting on `/send`. Set the
   token before sharing the URL.
-- The token travels in the query string (`?token=...`), which can land in
+- The token travels in the query string (`?token=…`), which can land in
   browser history and access logs, and the comparison is not timing-safe.
   It keeps casual visitors out; it is not hardened access control.
 - `/usage` shows the **100 most recent** sends Resend has on record; older
