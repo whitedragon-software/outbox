@@ -1,15 +1,5 @@
 # Changelog
 
-## 0.5.0
-
-### Added
-- Named the project **Outbox**; the default worker name is now `outbox`
-  (`name` field in `wrangler.toml`).
-- README: deploy steps, configuration table, the `AUTH_TOKEN` gate, a
-  verification snippet for the inline page scripts, a test checklist and
-  limitations.
-- This changelog.
-
 ## 0.4.0
 
 ### Added
@@ -56,8 +46,7 @@
 ### Fixed
 - `D1_ERROR: no such table: emails` on a fresh database: the `emails` table
   is now created automatically on first use, before both the insert and the
-  history query. Running `schema.sql` by hand is no longer required — it
-  remains in the repo as a reference copy.
+  history query. Running a schema by hand is no longer required.
 
 ## 0.2.0
 
@@ -90,6 +79,3 @@
 - Optional `AUTH_TOKEN` protection: pages require `?token=…`, API calls
   the `X-Auth-Token` header. **Unset, everything behaves as before.**
 - Configuration: `RESEND_KEY` (secret), `DOMAIN1` (var).
-
----
-
