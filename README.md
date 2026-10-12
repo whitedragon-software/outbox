@@ -5,7 +5,8 @@ domain: a compose form with live HTML preview, a complete send history in D1
 with rendered previews, and a usage dashboard that reads live from Resend so
 the numbers always match the provider's. All three pages share one dashboard
 shell — sidebar navigation on desktop, a top bar on mobile — with a
-light/dark theme toggle, light by default.
+light/dark theme toggle, light by default. Optional password login and a
+second sending domain.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -25,8 +26,9 @@ https://outbox.<username>.workers.dev/
 Paste `_worker.js` into the Worker editor in the Cloudflare dashboard:
 create a Worker, replace the boilerplate with the file's contents, then add
 under Settings the variables `RESEND_KEY` (as an encrypted secret) and
-`DOMAIN1` (plain text), and a D1 binding named `DB`. Done — no config file,
-no CLI. The free tier is enough.
+`DOMAIN1` (plain text), a D1 binding named `DB`, and — optionally — a
+`PASSWORD` secret (login screen) and a `DOMAIN2` var (second sending
+domain). Done — no config file, no CLI. The free tier is enough.
 
 Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 
@@ -37,7 +39,9 @@ Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
   "compatibility_date": "2024-09-01",
   "vars": {
     // must be a domain verified in Resend
-    "DOMAIN1": "yourdomain.com"
+    "DOMAIN1": "yourdomain.com",
+    // optional second verified domain
+    // "DOMAIN2": "seconddomain.com"
   },
   "d1_databases": [
     {
@@ -52,6 +56,7 @@ Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 
 ```
 npx wrangler secret put RESEND_KEY
+npx wrangler secret put PASSWORD   # optional
 npx wrangler deploy
 ```
 
@@ -59,39 +64,51 @@ Wrangler picks up `wrangler.jsonc` automatically — no flag needed. If you
 ever have both a `wrangler.toml` and a `wrangler.jsonc` in the folder,
 delete one, or Wrangler will complain about the ambiguity.
 
-`DOMAIN1` must be a domain verified in Resend (Domains tab).
+`DOMAIN1` (and `DOMAIN2`, if set) must be domains verified in Resend
+(Domains tab).
 
-### Optional: token protection
+### Optional: access protection
 
-Set an `AUTH_TOKEN` secret and every page and endpoint requires it:
+Two independent mechanisms; either one is enough, and both unset means the
+app is open.
 
-```
-npx wrangler secret put AUTH_TOKEN
-```
+**Password (`PASSWORD` secret).** Every page redirects to a login screen.
+A correct password sets a signed session cookie — HttpOnly, Secure,
+SameSite=Lax, valid 30 days — and returns you to the page you originally
+asked for. The cookie's signing key is derived from the password, so
+changing `PASSWORD` immediately logs out every browser everywhere. A
+"Log out" button appears in the sidebar.
 
-(or add `AUTH_TOKEN` as a secret in the dashboard). **Unset, Outbox behaves
-exactly as before.**
+**Token (`AUTH_TOKEN` secret).** Pages require `?token=…`; API calls
+require the `X-Auth-Token` header. Handy for curl and scripts, and for
+browsers where cookies get wiped.
 
 | Path | Purpose |
 |---|---|
 | `/` | Compose form. Open as `/?token=…` when a token is set. |
+| `/login` | Password login (only active when `PASSWORD` is set). |
+| `/logout` | Clears the session cookie (the sidebar's "Log out" button). |
 | `/sent` | History, newest first; click a message to expand the full body. |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
-| `POST /send` | JSON API. Send the token in the `X-Auth-Token` header. |
+| `POST /send` | JSON API. Token in the `X-Auth-Token` header, or the session cookie. |
 | `POST /usage/sync` | Refresh delivery details for the 25 most recent sends. |
 
 Pages take the token via `?token=`; the form and dashboard then pass it
 along in the `X-Auth-Token` header automatically, so links between pages
-keep working.
+keep working. With `PASSWORD` set and no `AUTH_TOKEN`, the POST endpoints
+need the session cookie — programmatic callers must log in first and send
+the cookie along.
 
 ---
 
 ## Using it
 
 Open the Worker's URL, fill in the form, send. The "From address" field is
-the local part only — the domain is always `DOMAIN1`, shown live in the hint
-under the field and in the sidebar. Multiple recipients, comma-separated.
-Every attempt is logged, including failures with Resend's error message.
+the local part only — the domain is one of your configured domains:
+`DOMAIN1`, plus `DOMAIN2` when set (chosen with the picker next to the
+field), shown live in the hint under the field and in the sidebar. Multiple
+recipients, comma-separated. Every attempt is logged, including failures
+with Resend's error message.
 
 For HTML email, check *Send as HTML* and paste your markup into the message
 box, then press **Preview** to see it rendered exactly as the recipient
@@ -110,6 +127,10 @@ curl -X POST https://outbox.<username>.workers.dev/send \
        "text":"Hello from Outbox"}'
 ```
 
+An optional `from_domain` field selects the sending domain when `DOMAIN2`
+is configured; anything other than the configured domains is rejected with
+a 400 naming the allowed ones.
+
 The `/usage` dashboard pulls the most recent sends straight from Resend's own
 records, so its counts agree with Resend's dashboard even for emails sent
 before the history feature existed — those get back-filled into `/sent` on
@@ -122,9 +143,19 @@ automatically, with the raw source collapsed under a *Source* drop-down.
 
 **Sending.** Input is validated (recipients, subject, body, Reply-To) before
 anything leaves the Worker; the message must be `text` or `html`. The `from`
-address is built as `local@DOMAIN1` with the local part sanitized; Resend's
-response is passed through — a 401 means a bad key, a 403 usually means the
-domain isn't verified in Resend yet.
+address is built as `local@` plus the chosen domain — the picker on the
+form, `from_domain` in the API — with the local part sanitized and the
+domain checked against the configured list; Resend's response is passed
+through — a 401 means a bad key, a 403 usually means the domain isn't
+verified in Resend yet.
+
+**Access.** Optional, two ways: a `PASSWORD` secret gates every page behind
+a login screen (signed 30-day session cookie whose key is derived from the
+password — rotating it revokes every session at once), and `AUTH_TOKEN`
+covers programmatic access (`?token=` on pages, `X-Auth-Token` on POSTs).
+Either credential is enough; with neither set, Outbox is open. All secret
+comparisons — header token, query token, password, cookie signature — are
+constant-time, and a failed login pauses half a second.
 
 **History.** Every send attempt — success *and* failure — is written to D1
 in the same request. The `emails` table is created automatically on first
@@ -153,13 +184,13 @@ HTML-escaped everywhere it appears outside those frames. Preview panes stay
 white in both themes: that is how the recipient sees the message.
 
 **Pages.** All three pages share one dashboard shell: sidebar navigation on
-desktop (current page highlighted, sending domain shown at the bottom) that
-collapses into a sticky top bar with tab navigation below 860 px, plus a
-light/dark theme toggle — light is the default, the choice is remembered
+desktop (current page highlighted, configured domains shown at the bottom)
+that collapses into a sticky top bar with tab navigation below 860 px, plus
+a light/dark theme toggle — light is the default, the choice is remembered
 per browser in localStorage, and the system color-scheme preference is
 deliberately not auto-detected. Everything is inline in the same file — no
 external assets, no client-side dependencies; the icons are inline SVG.
-Inline scripts read `DOMAIN` and `TOKEN` from Worker-side interpolations.
+Inline scripts read `DOMAINS` and `TOKEN` from Worker-side interpolations.
 
 ---
 
@@ -187,11 +218,12 @@ for f in .page*.mjs; do node --check "$f"; done
 rm -f .page*.mjs
 ```
 
-There are three inline scripts: the shared theme/sidebar script (no
-interpolations), the compose script and the usage script. The `${...}`
-substitutions (`DOMAIN`, `TOKEN`) are Worker-side interpolations —
-runtime-valid but invalid standalone JavaScript — so the extraction replaces
-them with `null` before checking.
+There are three inline scripts: the shared theme script (it also drives the
+login page's toggle — the login form itself is plain HTML, no script), the
+compose script and the usage script. The `${...}` substitutions (`DOMAINS`,
+`TOKEN`) are Worker-side interpolations — runtime-valid but invalid
+standalone JavaScript — so the extraction replaces them with `null` before
+checking.
 
 ---
 
@@ -222,17 +254,34 @@ them with `null` before checking.
    below ~860 px (or use the browser device toolbar): the sidebar collapses
    into a sticky top bar with Compose / Sent / Usage tabs, and the usage
    chart scrolls sideways instead of squashing its labels.
+10. With `PASSWORD` set: `/` redirects to `/login`; a wrong password shows
+    the error and stays put; the right one lands you on the page you
+    originally requested; "Log out" clears the session and the next visit
+    redirects again. Change the password and reload — the old session is
+    dead.
+11. With `DOMAIN2` set: the domain picker appears next to the From address;
+    the live preview follows it and a sent email's From domain matches the
+    pick. `POST /send` with a `from_domain` outside the configured list
+    returns a 400 naming the allowed domains.
 
 ---
 
 ## Limitations
 
-- **Without `AUTH_TOKEN`, anyone with the URL can send email from your
-  domain through your key.** There is no rate limiting on `/send`. Set the
-  token before sharing the URL.
+- **Without `AUTH_TOKEN` and `PASSWORD`, anyone with the URL can send email
+  from your domain through your key.** There is no rate limiting on `/send`.
+  Set one of them before sharing the URL.
 - The token travels in the query string (`?token=…`), which can land in
-  browser history and access logs, and the comparison is not timing-safe.
-  It keeps casual visitors out; it is not hardened access control.
+  browser history and access logs. Comparisons are constant-time now, but
+  the exposure itself remains — prefer `PASSWORD` login in browsers and
+  keep `AUTH_TOKEN` for scripts.
+- Login has no lockout: the half-second delay on a wrong password slows
+  brute force but doesn't stop it. Pick a long password.
+- Sessions can't be revoked individually — only all at once, by changing
+  `PASSWORD`. The cookie is `Secure`, so over plain HTTP (e.g.
+  `wrangler dev`) some browsers won't store it.
+- At most two sending domains (`DOMAIN1`, optional `DOMAIN2`); there is no
+  arbitrary domain list.
 - `/usage` shows the **100 most recent** sends Resend has on record; older
   history is not included (the page says so when it applies). Each page
   view costs one Resend API read, which counts against their rate limits.
