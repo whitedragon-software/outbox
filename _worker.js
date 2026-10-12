@@ -3,6 +3,11 @@ const RESEND_LIST_LIMIT = 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_RECIPIENTS = 50;
 
+// PASSWORD login sessions: 30-day signed cookies.
+const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
+const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_S * 1000;
+const LOGIN_FAIL_DELAY_MS = 500;
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -16,6 +21,121 @@ function escapeHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function redirect(location, status = 302) {
+  return new Response(null, {
+    status,
+    headers: { Location: location, "Cache-Control": "no-store" },
+  });
+}
+
+function sleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// --- Access control (AUTH_TOKEN and/or PASSWORD) ------------------------
+// Compares two strings without leaking contents through timing: hash both,
+// then compare the digests with a data-independent loop.
+async function constantTimeEqual(a, b) {
+  const enc = new TextEncoder();
+  const digests = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(a))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(b))),
+  ]);
+  const x = new Uint8Array(digests[0]);
+  const y = new Uint8Array(digests[1]);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+let sessionKeyCache = null;
+
+// The session signing key is derived from PASSWORD itself, so rotating the
+// password invalidates every cookie ever issued.
+async function sessionKey(env) {
+  if (sessionKeyCache) return sessionKeyCache;
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("outbox-session-key:" + env.PASSWORD)
+  );
+  sessionKeyCache = await crypto.subtle.importKey(
+    "raw", digest, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+  return sessionKeyCache;
+}
+
+async function sessionHmacHex(env, message) {
+  const key = await sessionKey(env);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return Array.prototype.map.call(new Uint8Array(sig), function (b) {
+    return ("0" + b.toString(16)).slice(-2);
+  }).join("");
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+async function hasValidSession(request, env) {
+  if (!env.PASSWORD) return false;
+  const m = /(?:^|;\s*)outbox_session=([0-9]+\.[0-9a-f]{64})/.exec(
+    request.headers.get("Cookie") || ""
+  );
+  if (!m) return false;
+  const parts = m[1].split(".");
+  if (parseInt(parts[0], 10) < Date.now()) return false;
+  const key = await sessionKey(env);
+  return crypto.subtle.verify(
+    "HMAC",
+    key,
+    hexToBytes(parts[1]),
+    new TextEncoder().encode("outbox-session." + parts[0])
+  );
+}
+
+// POST endpoints: the X-Auth-Token header (when AUTH_TOKEN is set) or a
+// valid login session (when PASSWORD is set). With neither configured the
+// endpoint stays open, exactly as before.
+async function isAuthorized(request, env) {
+  if (!env.AUTH_TOKEN && !env.PASSWORD) return true;
+  if (env.AUTH_TOKEN && (await constantTimeEqual(request.headers.get("x-auth-token") || "", env.AUTH_TOKEN))) {
+    return true;
+  }
+  if (env.PASSWORD && (await hasValidSession(request, env))) return true;
+  return false;
+}
+
+// Pages: a valid ?token= (when AUTH_TOKEN is set) or a login session.
+async function pageAuthOk(request, env, url) {
+  if (!env.AUTH_TOKEN && !env.PASSWORD) return true;
+  if (env.AUTH_TOKEN && (await constantTimeEqual(url.searchParams.get("token") || "", env.AUTH_TOKEN))) {
+    return true;
+  }
+  if (env.PASSWORD && (await hasValidSession(request, env))) return true;
+  return false;
+}
+
+// Returns null when a page request may proceed; otherwise the response to
+// send instead — a login redirect when PASSWORD protection is on, or the
+// old plain 401 for AUTH_TOKEN-only setups.
+async function requirePage(request, env, url) {
+  if (await pageAuthOk(request, env, url)) return null;
+  if (env.PASSWORD) {
+    return redirect("/login?next=" + encodeURIComponent(url.pathname + url.search));
+  }
+  return new Response("Unauthorized", { status: 401 });
+}
+
+// The post-login destination must be a same-site path: it starts with "/",
+// is not protocol-relative ("//"), and carries no header-breaking chars.
+function safeNext(raw) {
+  const s = String(raw || "");
+  if (!s.startsWith("/") || s.startsWith("//") || /[\r\n]/.test(s)) return "/";
+  return s;
 }
 
 // --- Auto schema creation + migration -----------------------------------
@@ -60,6 +180,63 @@ async function ensureSchema(env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const domains = env.DOMAIN2 ? [env.DOMAIN1, env.DOMAIN2] : [env.DOMAIN1];
+    const showLogout = !!env.PASSWORD;
+
+    // Login / logout (only active when PASSWORD is set)
+    if (url.pathname === "/login") {
+      if (!env.PASSWORD) return redirect("/");
+
+      if (request.method === "GET") {
+        if (await hasValidSession(request, env)) {
+          return redirect(safeNext(url.searchParams.get("next")));
+        }
+        return new Response(renderLoginPage(safeNext(url.searchParams.get("next")), null), {
+          headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+
+      if (request.method === "POST") {
+        let form = null;
+        try {
+          form = await request.formData();
+        } catch {}
+        const password = form ? String(form.get("password") || "") : "";
+        const next = safeNext(form ? form.get("next") : "/");
+
+        if (password && (await constantTimeEqual(password, env.PASSWORD))) {
+          const exp = Date.now() + SESSION_MAX_AGE_MS;
+          const sig = await sessionHmacHex(env, "outbox-session." + exp);
+          return new Response(null, {
+            status: 303,
+            headers: {
+              Location: next,
+              "Cache-Control": "no-store",
+              "Set-Cookie":
+                "outbox_session=" + exp + "." + sig +
+                "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + SESSION_MAX_AGE_S,
+            },
+          });
+        }
+
+        await sleep(LOGIN_FAIL_DELAY_MS);
+        return new Response(renderLoginPage(next, "Wrong password — try again."), {
+          status: 401,
+          headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/logout") {
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: env.PASSWORD ? "/login" : "/",
+          "Cache-Control": "no-store",
+          "Set-Cookie": "outbox_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+        },
+      });
+    }
 
     // The email form
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
@@ -70,22 +247,20 @@ export default {
         );
       }
 
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
       const token = url.searchParams.get("token") || "";
-      if (env.AUTH_TOKEN && token !== env.AUTH_TOKEN) {
-        return new Response("Unauthorized", { status: 401 });
-      }
 
-      return new Response(renderPage(env.DOMAIN1, token), {
+      return new Response(renderPage(domains, token, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
     }
 
     // Sent-messages history
     if (request.method === "GET" && url.pathname === "/sent") {
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
       const token = url.searchParams.get("token") || "";
-      if (env.AUTH_TOKEN && token !== env.AUTH_TOKEN) {
-        return new Response("Unauthorized", { status: 401 });
-      }
       if (!env.DB) {
         return new Response(
           "No D1 database is bound as DB.",
@@ -105,17 +280,16 @@ export default {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
 
-      return new Response(renderSentPage(rows, token, env.DOMAIN1), {
+      return new Response(renderSentPage(rows, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
     }
 
     // Usage dashboard — reads live from Resend (with D1 as fallback)
     if (request.method === "GET" && url.pathname === "/usage") {
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
       const token = url.searchParams.get("token") || "";
-      if (env.AUTH_TOKEN && token !== env.AUTH_TOKEN) {
-        return new Response("Unauthorized", { status: 401 });
-      }
       if (!env.RESEND_KEY) {
         return new Response(
           "RESEND_KEY is not set.",
@@ -148,14 +322,14 @@ export default {
           "Could not read from Resend (" + resend.error + ") — showing local database stats instead.";
       }
 
-      return new Response(renderUsagePage(stats, token, env.DOMAIN1), {
+      return new Response(renderUsagePage(stats, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
     }
 
     // Refresh delivery details for the most recent emails
     if (request.method === "POST" && url.pathname === "/usage/sync") {
-      if (env.AUTH_TOKEN && request.headers.get("x-auth-token") !== env.AUTH_TOKEN) {
+      if (!(await isAuthorized(request, env))) {
         return json({ success: false, error: "Unauthorized." }, 401);
       }
       if (!env.DB) {
@@ -181,8 +355,8 @@ export default {
 
 // --- Sending + automatic DB write ---------------------------------------
 async function handleSend(request, env) {
-  // Optional protection: only active if you set an AUTH_TOKEN variable
-  if (env.AUTH_TOKEN && request.headers.get("x-auth-token") !== env.AUTH_TOKEN) {
+  // Optional protection: the X-Auth-Token header, or a PASSWORD login session.
+  if (!(await isAuthorized(request, env))) {
     return json({ success: false, error: "Unauthorized." }, 401);
   }
 
@@ -206,6 +380,17 @@ async function handleSend(request, env) {
     String(body.from_local || "noreply").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "") ||
     "noreply";
 
+  // The sending domain must be one the operator configured.
+  const allowedDomains = [String(env.DOMAIN1 || "").toLowerCase()];
+  if (env.DOMAIN2) allowedDomains.push(String(env.DOMAIN2).toLowerCase());
+  const fromDomain = String(body.from_domain || env.DOMAIN1 || "").trim().toLowerCase();
+  if (!allowedDomains.includes(fromDomain)) {
+    return json(
+      { success: false, error: "from_domain must be one of: " + allowedDomains.join(", ") + "." },
+      400
+    );
+  }
+
   if (recipients.length === 0 || !recipients.every((e) => EMAIL_RE.test(e))) {
     return json({ success: false, error: "Please provide valid recipient email address(es)." }, 400);
   }
@@ -221,8 +406,8 @@ async function handleSend(request, env) {
   }
 
   const from = fromName
-    ? fromName + " <" + fromLocal + "@" + env.DOMAIN1 + ">"
-    : fromLocal + "@" + env.DOMAIN1;
+    ? fromName + " <" + fromLocal + "@" + fromDomain + ">"
+    : fromLocal + "@" + fromDomain;
 
   const payload = { from, to: recipients, subject };
   if (text) payload.text = text;
@@ -600,6 +785,38 @@ const ICON_SUN =
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<circle cx="12" cy="12" r="4"/>' +
   '<path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+const ICON_LOGOUT =
+  '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>' +
+  '<polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>';
+
+// Restores the saved theme before first paint, and flips it on any click of
+// #theme-toggle (the shell and the login page both carry that button).
+const THEME_SCRIPT = `<script>
+(function () {
+  try {
+    var t = localStorage.getItem("outbox-theme");
+    if (t === "dark" || t === "light") {
+      document.documentElement.setAttribute("data-theme", t);
+    }
+  } catch (e) {}
+  document.addEventListener("click", function (e) {
+    var el = e.target;
+    while (el && el.nodeType === 1) {
+      if (el.id === "theme-toggle") {
+        var root = document.documentElement;
+        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme", next);
+        try { localStorage.setItem("outbox-theme", next); } catch (err) {}
+        return;
+      }
+      if (el === document.body) return;
+      el = el.parentNode;
+    }
+  });
+})();
+</script>`;
 
 const SHARED_CSS = `
   * { box-sizing: border-box; }
@@ -738,6 +955,23 @@ const SHARED_CSS = `
   .theme-toggle .when-dark { display: none; align-items: center; gap: 9px; }
   html:not([data-theme="dark"]) .theme-toggle .when-light { display: flex; }
   html[data-theme="dark"] .theme-toggle .when-dark { display: flex; }
+  .logout-form { margin: 0; }
+  .logout-btn {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 9px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--ghost-bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .logout-btn:hover { background: var(--ghost-hover); }
   .side-foot { padding: 0 10px; font-size: 12px; color: var(--muted); line-height: 1.5; }
   .foot-domain {
     color: var(--fg);
@@ -746,6 +980,7 @@ const SHARED_CSS = `
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .foot-domain + .foot-domain { margin-top: 1px; }
 
   .main { flex: 1; min-width: 0; padding: 34px 24px 60px; }
   .content { max-width: 720px; margin: 0 auto; }
@@ -784,7 +1019,7 @@ const SHARED_CSS = `
   .btn.ghost:hover:not(:disabled) { background: var(--ghost-hover); border-color: var(--border-strong); }
 
   label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
-  input, textarea {
+  input, textarea, select {
     width: 100%;
     padding: 10px 12px;
     font: inherit;
@@ -794,7 +1029,8 @@ const SHARED_CSS = `
     border: 1px solid var(--input-border);
     border-radius: 8px;
   }
-  input:focus, textarea:focus { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
+  select { cursor: pointer; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
   input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 0; accent-color: var(--accent); }
   textarea { min-height: 150px; resize: vertical; }
 
@@ -840,9 +1076,10 @@ const SHARED_CSS = `
     }
     .brand { grid-area: brand; padding: 2px 0; font-size: 15px; }
     .brand-icon { width: 30px; height: 30px; border-radius: 8px; }
-    .side-bottom { grid-area: side; margin-top: 0; padding-top: 0; }
+    .side-bottom { grid-area: side; margin-top: 0; padding-top: 0; flex-direction: row; gap: 6px; align-items: center; }
     .side-foot { display: none; }
     .theme-toggle { width: auto; padding: 8px 12px; }
+    .logout-btn { width: auto; padding: 8px 12px; }
     .nav {
       grid-area: nav;
       flex-direction: row;
@@ -856,9 +1093,12 @@ const SHARED_CSS = `
     .main { padding: 22px 16px 52px; }
     .card { padding: 18px; }
   }
+  @media (max-width: 480px) {
+    .theme-toggle .btn-label, .logout-btn .btn-label { display: none; }
+  }
 `;
 
-// o: { title, active, token, domain, width, content, extraCss, script }
+// o: { title, active, token, domains, showLogout, width, content, extraCss, script }
 function renderShell(o) {
   const token = o.token || "";
   const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
@@ -874,10 +1114,15 @@ function renderShell(o) {
     navLink("/" + tokenParam, "compose", "Compose", ICON_COMPOSE) +
     navLink("/sent" + tokenParam, "sent", "Sent", ICON_SENT) +
     navLink("/usage" + tokenParam, "usage", "Usage", ICON_USAGE);
-  const foot =
-    '<div class="side-foot">' +
-    (o.domain ? '<div class="foot-domain">' + escapeHtml(o.domain) + "</div>" : "") +
-    "delivered via Resend</div>";
+  const footDomains = (o.domains || [])
+    .map(function (d) { return '<div class="foot-domain">' + escapeHtml(d) + "</div>"; })
+    .join("");
+  const foot = '<div class="side-foot">' + footDomains + "delivered via Resend</div>";
+  const logout = o.showLogout
+    ? '<form method="post" action="/logout" class="logout-form">' +
+      '<button type="submit" class="logout-btn" aria-label="Log out">' +
+      ICON_LOGOUT + '<span class="btn-label">Log out</span></button></form>'
+    : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -889,30 +1134,7 @@ function renderShell(o) {
  ${SHARED_CSS}
  ${o.extraCss || ""}
 </style>
-<script>
-(function () {
-  try {
-    var t = localStorage.getItem("outbox-theme");
-    if (t === "dark" || t === "light") {
-      document.documentElement.setAttribute("data-theme", t);
-    }
-  } catch (e) {}
-  document.addEventListener("click", function (e) {
-    var el = e.target;
-    while (el && el.nodeType === 1) {
-      if (el.id === "theme-toggle") {
-        var root = document.documentElement;
-        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
-        root.setAttribute("data-theme", next);
-        try { localStorage.setItem("outbox-theme", next); } catch (err) {}
-        return;
-      }
-      if (el === document.body) return;
-      el = el.parentNode;
-    }
-  });
-})();
-</script>
+ ${THEME_SCRIPT}
 </head>
 <body>
 <div class="shell">
@@ -924,9 +1146,10 @@ function renderShell(o) {
     <nav class="nav">${nav}</nav>
     <div class="side-bottom">
       <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Switch color theme">
-        <span class="when-light">${ICON_MOON}<span>Dark mode</span></span>
-        <span class="when-dark">${ICON_SUN}<span>Light mode</span></span>
+        <span class="when-light">${ICON_MOON}<span class="btn-label">Dark mode</span></span>
+        <span class="when-dark">${ICON_SUN}<span class="btn-label">Light mode</span></span>
       </button>
+      ${logout}
       ${foot}
     </div>
   </aside>
@@ -939,9 +1162,71 @@ function renderShell(o) {
 </html>`;
 }
 
-function renderPage(domain, token) {
-  const domainJson = JSON.stringify(domain).replace(/</g, "\\u003c");
+// The login page stands apart from the shell (no navigation until you are
+// in), but shares its CSS and the theme toggle. Plain HTML form POST — the
+// page itself needs no script.
+function renderLoginPage(next, error) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in — Outbox</title>
+<style>
+ ${SHARED_CSS}
+  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+  .login-card { width: 100%; max-width: 340px; }
+  .login-brand { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+  .login-card .sub { color: var(--muted); font-size: 14px; margin: 6px 0 4px; }
+  .login-card .warn { margin: 0 0 8px; }
+  .login-card .btn { margin-top: 18px; }
+  .login-hint { margin: 14px 0 0; text-align: center; }
+  .login-theme { position: fixed; top: 14px; right: 14px; }
+  .login-theme .theme-toggle { width: auto; padding: 8px 12px; }
+</style>
+ ${THEME_SCRIPT}
+</head>
+<body>
+<div class="login-theme">
+  <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Switch color theme">
+    <span class="when-light">${ICON_MOON}<span class="btn-label">Dark mode</span></span>
+    <span class="when-dark">${ICON_SUN}<span class="btn-label">Light mode</span></span>
+  </button>
+</div>
+<div class="login-wrap">
+  <div class="card login-card">
+    <div class="login-brand"><span class="brand-icon">${ICON_BRAND}</span><span>Outbox</span></div>
+    <p class="sub">Enter the password to continue.</p>
+    ${error ? '<div class="warn">' + escapeHtml(error) + "</div>" : ""}
+    <form method="post" action="/login">
+      <label for="password">Password</label>
+      <input id="password" type="password" name="password" required autofocus autocomplete="current-password">
+      <input type="hidden" name="next" value="${escapeHtml(next)}">
+      <button type="submit" class="btn block">Log in</button>
+    </form>
+    <p class="muted login-hint">Stays signed in for 30 days on this browser.</p>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+function renderPage(domains, token, showLogout) {
+  const domain1 = domains[0];
+  const domain2 = domains.length > 1 ? domains[1] : null;
+  const domainsJson = JSON.stringify(domains).replace(/</g, "\\u003c");
   const tokenJson = JSON.stringify(token || "").replace(/</g, "\\u003c");
+
+  // With a second domain configured, the From field grows a picker; with
+  // one domain the markup is exactly what it always was.
+  const fromControl = domain2
+    ? '<div class="from-row">' +
+      '<input id="from_local" type="text" value="noreply">' +
+      '<select id="from_domain" aria-label="Sending domain">' +
+      '<option value="' + escapeHtml(domain1) + '" selected>' + escapeHtml(domain1) + "</option>" +
+      '<option value="' + escapeHtml(domain2) + '">' + escapeHtml(domain2) + "</option>" +
+      "</select></div>"
+    : '<input id="from_local" type="text" value="noreply">';
 
   const content = `
 <div class="page-head">
@@ -955,7 +1240,7 @@ function renderPage(domain, token) {
     <label for="from_name">From name</label>
     <input id="from_name" type="text" placeholder="Optional, e.g. My App">
     <label for="from_local">From address</label>
-    <input id="from_local" type="text" value="noreply">
+    ${fromControl}
     <div class="hint" id="from-preview"></div>
     <label for="reply_to">Reply-To</label>
     <input id="reply_to" type="email" placeholder="Optional">
@@ -976,6 +1261,9 @@ function renderPage(domain, token) {
 
   const extraCss = `
   .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .from-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .from-row input { flex: 1 1 150px; min-width: 0; }
+  .from-row select { flex: 0 1 auto; max-width: 100%; }
   .row { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; gap: 12px; flex-wrap: wrap; }
   .checkrow { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; margin: 0; cursor: pointer; }
   .preview-frame, .preview-text {
@@ -1002,11 +1290,12 @@ function renderPage(domain, token) {
 
   const script = `<script>
 (function () {
-  var DOMAIN = ${domainJson};
+  var DOMAINS = ${domainsJson};
   var TOKEN = ${tokenJson};
   var form = document.getElementById("send-form");
   var statusBox = document.getElementById("status");
   var localInput = document.getElementById("from_local");
+  var domainSel = document.getElementById("from_domain");
   var fromPreview = document.getElementById("from-preview");
   var btn = document.getElementById("submit-btn");
   var htmlBox = document.getElementById("as_html");
@@ -1019,9 +1308,11 @@ function renderPage(domain, token) {
 
   function updatePreview() {
     var local = (localInput.value || "").trim().toLowerCase() || "noreply";
-    fromPreview.textContent = "Will be sent as: " + local + "@" + DOMAIN;
+    var domain = domainSel ? domainSel.value : DOMAINS[0];
+    fromPreview.textContent = "Will be sent as: " + local + "@" + domain;
   }
   localInput.addEventListener("input", updatePreview);
+  if (domainSel) domainSel.addEventListener("change", updatePreview);
   updatePreview();
 
   function renderPreview() {
@@ -1074,6 +1365,7 @@ function renderPage(domain, token) {
       reply_to: document.getElementById("reply_to").value,
       subject: document.getElementById("subject").value
     };
+    if (domainSel) payload.from_domain = domainSel.value;
     if (htmlBox.checked) {
       payload.html = messageBox.value;
     } else {
@@ -1117,7 +1409,8 @@ function renderPage(domain, token) {
     title: "Outbox",
     active: "compose",
     token: token,
-    domain: domain,
+    domains: domains,
+    showLogout: showLogout,
     width: "narrow",
     content: content,
     extraCss: extraCss,
@@ -1125,7 +1418,7 @@ function renderPage(domain, token) {
   });
 }
 
-function renderSentPage(rows, token, domain) {
+function renderSentPage(rows, token, domains, showLogout) {
   const items = rows.length
     ? rows
         .map(function (r) {
@@ -1207,14 +1500,15 @@ function renderSentPage(rows, token, domain) {
     title: "Sent Messages — Outbox",
     active: "sent",
     token: token,
-    domain: domain,
+    domains: domains,
+    showLogout: showLogout,
     content: content,
     extraCss: extraCss,
     script: "",
   });
 }
 
-function renderUsagePage(stats, token, domain) {
+function renderUsagePage(stats, token, domains, showLogout) {
   const tokenJson = JSON.stringify(token || "").replace(/</g, "\\u003c");
 
   const isResend = stats.source === "resend";
@@ -1370,10 +1664,11 @@ function renderUsagePage(stats, token, domain) {
     title: "API Usage — Outbox",
     active: "usage",
     token: token,
-    domain: domain,
+    domains: domains,
+    showLogout: showLogout,
     width: "wide",
     content: content,
     extraCss: extraCss,
     script: script,
   });
-      }
+}
