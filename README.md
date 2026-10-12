@@ -1,9 +1,9 @@
 # Outbox
 
 A single-file Cloudflare Worker that sends email through Resend from your own
-domain: a white-background compose form, a complete send history in D1, and a
-usage dashboard that reads live from Resend so the numbers always match the
-provider's.
+domain: a white-background compose form with live HTML preview, a complete
+send history in D1 with rendered previews, and a usage dashboard that reads
+live from Resend so the numbers always match the provider's.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -91,36 +91,47 @@ the local part only — the domain is always `DOMAIN1`, shown live in the hint
 under the field. Multiple recipients, comma-separated. Every attempt is
 logged, including failures with Resend's error message.
 
-Programmatic use:
+For HTML email, check *Send as HTML* and paste your markup into the message
+box, then press **Preview** to see it rendered exactly as the recipient
+will — in a sandboxed frame, so scripts never run. *Back to editing*
+returns to the source; toggling the HTML checkbox re-renders the preview
+live. The preview also works for plain text (shown as it will arrive).
+
+Programmatic use — `text`, `html`, or both (both = HTML with a plain-text
+fallback part, which is friendliest to spam filters):
 
 ```
 curl -X POST https://outbox.<username>.workers.dev/send \
   -H "Content-Type: application/json" \
-  -d '{"to":"name@example.com","subject":"Hi","text":"Hello from Outbox"}'
+  -d '{"to":"name@example.com","subject":"Hi",
+       "html":"<p>Hello <b>from Outbox</b></p>",
+       "text":"Hello from Outbox"}'
 ```
 
 The `/usage` dashboard pulls the most recent sends straight from Resend's own
 records, so its counts agree with Resend's dashboard even for emails sent
 before the history feature existed — those get back-filled into `/sent` on
-the first visit.
+the first visit. On `/sent`, HTML messages display as the rendered preview
+automatically, with the raw source collapsed under a *Source* drop-down.
 
 ---
 
 ## How it works
 
 **Sending.** Input is validated (recipients, subject, body, Reply-To) before
-anything leaves the Worker. The `from` address is built as
-`local@DOMAIN1` with the local part sanitized; Resend's response is passed
-through — a 401 means a bad key, a 403 usually means the domain isn't
-verified in Resend yet.
+anything leaves the Worker; the message must be `text` or `html`. The `from`
+address is built as `local@DOMAIN1` with the local part sanitized; Resend's
+response is passed through — a 401 means a bad key, a 403 usually means the
+domain isn't verified in Resend yet.
 
 **History.** Every send attempt — success *and* failure — is written to D1
 in the same request. The `emails` table is created automatically on first
 use (`CREATE TABLE IF NOT EXISTS`, so it never touches existing data), and
-the `delivery_status` column is added by an `ALTER TABLE` whose
-"duplicate column" error is expected and swallowed. DB writes are wrapped
-so a logging failure never turns a delivered email into an error: the form
-shows a "could not save to history" warning instead.
+the `delivery_status` and `content_type` columns are added by `ALTER TABLE`
+migrations whose "duplicate column" errors are expected and swallowed. DB
+writes are wrapped so a logging failure never turns a delivered email into
+an error: the form shows a "could not save to history" warning instead.
+When both `text` and `html` are sent, the HTML part is what gets archived.
 
 **Usage.** `/usage` calls Resend's list endpoint on every page load and
 computes all numbers from Resend's own records — the one exception is
@@ -132,6 +143,11 @@ unreachable, the page falls back to D1 stats with a red warning naming the
 data source. The response shape is handled defensively (`{"data": [...]}`
 or a bare array); if Resend changes it, `/usage` degrades to the fallback
 rather than breaking.
+
+**Previews.** Both the compose-page preview and the `/sent` history preview
+use an iframe with an empty `sandbox` attribute — scripts, forms and
+navigation inside the message cannot run. The message body is also
+HTML-escaped everywhere it appears outside those frames.
 
 **Pages.** All three pages are inline HTML in the same file — white
 background, no external assets, no client-side dependencies. Inline scripts
@@ -171,8 +187,8 @@ them with `null` before checking.
 
 ## Quick test checklist
 
-1. Compose page loads; the hint under "From address" reads
-   `noreply@DOMAIN1` and updates as you type.
+1. Compose page loads with the title "Outbox"; the hint under "From address"
+   reads `noreply@DOMAIN1` and updates as you type.
 2. Send a test email: green confirmation with a Resend ID.
 3. `/sent`: the message is there, newest first; click it — from, to,
    subject and full body render; delivery status appears after a usage sync.
@@ -186,6 +202,10 @@ them with `null` before checking.
    links without losing the token.
 7. Missing `RESEND_KEY` or `DOMAIN1`: a plain-text configuration error,
    not a 1102 crash.
+8. Check "Send as HTML", paste `<p><b>bold</b> and <i>italic</i></p>`, press
+   Preview: the rendered text appears; "Back to editing" returns to the
+   source. Send it: the email arrives formatted, and `/sent` shows the
+   rendered preview with the source collapsed under the *Source* drop-down.
 
 ---
 
@@ -203,8 +223,10 @@ them with `null` before checking.
 - "Rejected (worker log)" only counts failures *this worker* saw. If the
   same key is used by other apps, their sends appear in the Resend numbers
   but their failures are invisible here.
-- Plain-text bodies only: no HTML composing, no attachments, no
-  templates. `Reply-To` is a single address.
+- No attachments, no templates, no rich-text editor — HTML is written by
+  hand, and nothing sanitizes what you send (it's your own content going
+  to your own recipients). `Reply-To` is a single address.
+- When both `text` and `html` are sent, only the HTML part is archived.
 - At most 50 recipients per send.
 - Resend's free plan allows 100 emails/day; the "Last 24 hours" card on
   `/usage` is the number to watch. D1 free-tier row limits are far above
@@ -213,3 +235,5 @@ them with `null` before checking.
   writes to the local D1 copy, production to the remote one. Sends made in
   dev do not appear in the deployed `/sent` (they still show in `/usage`,
   since that reads from Resend).
+
+That's the 0.5.0 docs set: this README, the 0.5.0 changelog entry, `_worker.js`, and `wrangler.jsonc`.
