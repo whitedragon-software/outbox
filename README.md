@@ -235,5 +235,3 @@ them with `null` before checking.
   writes to the local D1 copy, production to the remote one. Sends made in
   dev do not appear in the deployed `/sent` (they still show in `/usage`,
   since that reads from Resend).
-
-That's the 0.5.0 docs set: this README, the 0.5.0 changelog entry, `_worker.js`, and `wrangler.jsonc`.
