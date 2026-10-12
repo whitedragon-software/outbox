@@ -32,6 +32,7 @@ async function ensureSchema(env) {
       "reply_to TEXT, " +
       "subject TEXT NOT NULL, " +
       "body TEXT NOT NULL, " +
+      "content_type TEXT, " +
       "status TEXT NOT NULL DEFAULT 'sent', " +
       "error TEXT, " +
       "created_at TEXT NOT NULL DEFAULT (datetime('now'))" +
@@ -40,8 +41,15 @@ async function ensureSchema(env) {
   await env.DB.prepare(
     "CREATE INDEX IF NOT EXISTS idx_emails_created ON emails (created_at DESC)"
   ).run();
+  // Migrations for databases created by older builds. "Duplicate column"
+  // errors are expected once a column exists, so those are swallowed.
   try {
     await env.DB.prepare("ALTER TABLE emails ADD COLUMN delivery_status TEXT").run();
+  } catch (e) {
+    if (!String(e.message || e).includes("duplicate column")) throw e;
+  }
+  try {
+    await env.DB.prepare("ALTER TABLE emails ADD COLUMN content_type TEXT").run();
   } catch (e) {
     if (!String(e.message || e).includes("duplicate column")) throw e;
   }
@@ -121,13 +129,9 @@ export default {
       let stats;
 
       if (resend.ok) {
-        // Back-fill D1 with anything the worker never logged, and refresh
-        // stored delivery statuses. Best-effort: never blocks the page.
         if (env.DB) await reconcileFromResend(env, resend.list);
 
         stats = resend.stats;
-        // Failures are things Resend rejected — only the worker saw those,
-        // so that one number still comes from our own log.
         let failed = 0;
         if (env.DB) {
           try {
@@ -139,8 +143,6 @@ export default {
         }
         stats.cards.push({ num: failed, lbl: "Rejected (worker log)", bad: true });
       } else {
-        // Resend unreachable — fall back to local database stats so the
-        // page still works, with a clear warning about the data source.
         stats = env.DB ? await getD1Stats(env) : emptyStats();
         stats.warning =
           "Could not read from Resend (" + resend.error + ") — showing local database stats instead.";
@@ -197,6 +199,7 @@ async function handleSend(request, env) {
     .filter(Boolean);
   const subject = String(body.subject || "").trim();
   const text = String(body.text || "").trim();
+  const html = String(body.html || "").trim();
   const replyTo = String(body.reply_to || "").trim();
   const fromName = String(body.from_name || "").trim().replace(/["<>]/g, "");
   const fromLocal =
@@ -210,7 +213,9 @@ async function handleSend(request, env) {
     return json({ success: false, error: "Too many recipients (max " + MAX_RECIPIENTS + ")." }, 400);
   }
   if (!subject) return json({ success: false, error: "Subject is required." }, 400);
-  if (!text) return json({ success: false, error: "Message cannot be empty." }, 400);
+  if (!text && !html) {
+    return json({ success: false, error: "Message cannot be empty (provide text or html)." }, 400);
+  }
   if (replyTo && !EMAIL_RE.test(replyTo)) {
     return json({ success: false, error: "Reply-To must be a valid email address." }, 400);
   }
@@ -219,10 +224,16 @@ async function handleSend(request, env) {
     ? fromName + " <" + fromLocal + "@" + env.DOMAIN1 + ">"
     : fromLocal + "@" + env.DOMAIN1;
 
-  const payload = { from, to: recipients, subject, text };
+  const payload = { from, to: recipients, subject };
+  if (text) payload.text = text;
+  if (html) payload.html = html;
   if (replyTo) payload.reply_to = replyTo;
 
   await ensureSchema(env);
+
+  // What gets archived: the HTML part when present, otherwise the text.
+  const storedBody = html || text;
+  const contentType = html ? "html" : "text";
 
   let res;
   try {
@@ -235,8 +246,8 @@ async function handleSend(request, env) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    await logEmail(env, null, from, recipients, replyTo, subject, text,
-      "failed", "Could not reach Resend: " + err.message);
+    await logEmail(env, null, from, recipients, replyTo, subject,
+      storedBody, contentType, "failed", "Could not reach Resend: " + err.message);
     return json({ success: false, error: "Could not reach Resend: " + err.message }, 502);
   }
 
@@ -244,26 +255,28 @@ async function handleSend(request, env) {
 
   if (res.ok) {
     const saved = await logEmail(env, data.id || null, from, recipients, replyTo,
-      subject, text, "sent", null);
+      subject, storedBody, contentType, "sent", null);
     return json({ success: true, id: data.id || null, saved: saved });
   }
 
   const errMsg = data.message || "Resend returned HTTP " + res.status + ".";
-  await logEmail(env, null, from, recipients, replyTo, subject, text, "failed", errMsg);
+  await logEmail(env, null, from, recipients, replyTo, subject,
+    storedBody, contentType, "failed", errMsg);
   return json({ success: false, error: errMsg }, 502);
 }
 
 // Writes the message into D1. Returns false (without throwing) if the
 // database is unavailable, so a logging problem never breaks the send.
-async function logEmail(env, resendId, from, recipients, replyTo, subject, text, status, error) {
+async function logEmail(env, resendId, from, recipients, replyTo, subject, body, contentType, status, error) {
   if (!env.DB) return false;
   await ensureSchema(env);
   try {
     await env.DB.prepare(
-      "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, status, error) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, content_type, status, error) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind(resendId, from, recipients.join(", "), replyTo || null, subject, text, status, error)
+      .bind(resendId, from, recipients.join(", "), replyTo || null, subject, body,
+        contentType, status, error)
       .run();
     return true;
   } catch {
@@ -272,8 +285,6 @@ async function logEmail(env, resendId, from, recipients, replyTo, subject, text,
 }
 
 // --- Live stats straight from Resend ------------------------------------
-// Fetches the most recent emails Resend has on record for this API key and
-// computes all dashboard numbers from Resend's own data.
 async function getResendStats(env) {
   let body;
   try {
@@ -361,8 +372,7 @@ async function getResendStats(env) {
   };
 }
 
-// Back-fills D1 with emails Resend knows about that the worker never logged
-// (e.g. sends from before logging existed, or from other apps using the key),
+// Back-fills D1 with emails Resend knows about that the worker never logged,
 // and refreshes stored delivery statuses. Best-effort: never throws.
 async function reconcileFromResend(env, list) {
   if (!env.DB || !Array.isArray(list)) return;
@@ -386,7 +396,6 @@ async function reconcileFromResend(env, list) {
         continue;
       }
 
-      // Not in our log yet — import it
       const tos = Array.isArray(e.to) ? e.to : e.to ? [String(e.to)] : [];
       const replyTo = Array.isArray(e.reply_to)
         ? e.reply_to.join(", ")
@@ -397,10 +406,12 @@ async function reconcileFromResend(env, list) {
       const createdSql = isNaN(created.getTime())
         ? new Date().toISOString().slice(0, 19).replace("T", " ")
         : created.toISOString().slice(0, 19).replace("T", " ");
+      const storedBody = e.text ? String(e.text) : e.html ? String(e.html) : "(imported from Resend)";
+      const contentType = e.text ? "text" : e.html ? "html" : null;
 
       await env.DB.prepare(
-        "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, status, error, created_at, delivery_status) " +
-        "VALUES (?, ?, ?, ?, ?, ?, 'sent', NULL, ?, ?)"
+        "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, content_type, status, error, created_at, delivery_status) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', NULL, ?, ?)"
       )
         .bind(
           e.id,
@@ -408,7 +419,8 @@ async function reconcileFromResend(env, list) {
           tos.join(", "),
           replyTo,
           String(e.subject || "(no subject)"),
-          String(e.text || e.html || "(imported from Resend)"),
+          storedBody,
+          contentType,
           createdSql,
           ev
         )
@@ -563,9 +575,10 @@ function renderPage(domain, token) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Send Email</title>
+<title>Outbox</title>
 <style>
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     background: #ffffff;
     color: #1a1a1a;
@@ -599,6 +612,9 @@ function renderPage(domain, token) {
   input:focus, textarea:focus { outline: 2px solid #1a1a1a; outline-offset: -1px; border-color: #1a1a1a; }
   textarea { min-height: 140px; resize: vertical; }
   .hint { font-size: 12px; color: #888; margin-top: 4px; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; gap: 12px; }
+  .checkrow { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; margin: 0; cursor: pointer; }
+  .checkrow input { width: auto; margin: 0; }
   button {
     margin-top: 20px;
     width: 100%;
@@ -614,6 +630,33 @@ function renderPage(domain, token) {
   }
   button:disabled { opacity: .6; cursor: default; }
   button:hover:not(:disabled) { background: #000; }
+  button.preview-btn {
+    width: auto;
+    margin-top: 0;
+    padding: 8px 14px;
+    font-size: 13px;
+    background: #fff;
+    color: #1a1a1a;
+    border: 1px solid #ccc;
+  }
+  button.preview-btn:hover:not(:disabled) { background: #f5f5f5; }
+  .preview-frame, .preview-text {
+    width: 100%;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fff;
+    margin-top: 12px;
+  }
+  .preview-frame { height: 240px; display: block; }
+  .preview-text {
+    min-height: 140px;
+    padding: 12px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font: inherit;
+    font-size: 14px;
+    color: #1a1a1a;
+  }
   .status { margin-top: 16px; font-size: 14px; min-height: 20px; }
   .status.success { color: #0a7d32; }
   .status.error { color: #c0392b; }
@@ -623,7 +666,7 @@ function renderPage(domain, token) {
 </head>
 <body>
 <div class="card">
-  <h1>Send an email</h1>
+  <h1>Outbox</h1>
   <p class="sub">Delivered via Resend, from your verified domain.</p>
   <form id="send-form">
     <label for="to">To</label>
@@ -637,8 +680,14 @@ function renderPage(domain, token) {
     <input id="reply_to" type="email" placeholder="Optional">
     <label for="subject">Subject</label>
     <input id="subject" type="text" required>
-    <label for="message">Message</label>
+    <label for="message" id="message-label">Message</label>
     <textarea id="message" required></textarea>
+    <div class="row">
+      <label class="checkrow"><input type="checkbox" id="as_html"> Send as HTML</label>
+      <button type="button" id="preview-btn" class="preview-btn">Preview</button>
+    </div>
+    <iframe id="preview-frame" class="preview-frame" sandbox="" hidden></iframe>
+    <pre id="preview-text" class="preview-text" hidden></pre>
     <button id="submit-btn" type="submit">Send email</button>
   </form>
   <div class="status" id="status"></div>
@@ -654,6 +703,13 @@ function renderPage(domain, token) {
   var localInput = document.getElementById("from_local");
   var fromPreview = document.getElementById("from-preview");
   var btn = document.getElementById("submit-btn");
+  var htmlBox = document.getElementById("as_html");
+  var msgLabel = document.getElementById("message-label");
+  var messageBox = document.getElementById("message");
+  var previewBtn = document.getElementById("preview-btn");
+  var previewFrame = document.getElementById("preview-frame");
+  var previewText = document.getElementById("preview-text");
+  var previewing = false;
 
   function updatePreview() {
     var local = (localInput.value || "").trim().toLowerCase() || "noreply";
@@ -662,6 +718,42 @@ function renderPage(domain, token) {
   localInput.addEventListener("input", updatePreview);
   updatePreview();
 
+  function renderPreview() {
+    if (htmlBox.checked) {
+      previewFrame.hidden = false;
+      previewText.hidden = true;
+      previewFrame.srcdoc = messageBox.value || "<p>(empty message)</p>";
+    } else {
+      previewFrame.hidden = true;
+      previewText.hidden = false;
+      previewText.textContent = messageBox.value || "(empty message)";
+    }
+  }
+
+  function exitPreview() {
+    previewing = false;
+    previewFrame.hidden = true;
+    previewText.hidden = true;
+    messageBox.hidden = false;
+    previewBtn.textContent = "Preview";
+  }
+
+  htmlBox.addEventListener("change", function () {
+    msgLabel.textContent = htmlBox.checked ? "Message (HTML)" : "Message";
+    if (previewing) renderPreview();
+  });
+
+  previewBtn.addEventListener("click", function () {
+    if (previewing) {
+      exitPreview();
+    } else {
+      previewing = true;
+      renderPreview();
+      messageBox.hidden = true;
+      previewBtn.textContent = "Back to editing";
+    }
+  });
+
   form.addEventListener("submit", function (e) {
     e.preventDefault();
     btn.disabled = true;
@@ -669,17 +761,23 @@ function renderPage(domain, token) {
     statusBox.textContent = "";
     statusBox.className = "status";
 
+    var payload = {
+      to: document.getElementById("to").value,
+      from_name: document.getElementById("from_name").value,
+      from_local: localInput.value,
+      reply_to: document.getElementById("reply_to").value,
+      subject: document.getElementById("subject").value
+    };
+    if (htmlBox.checked) {
+      payload.html = messageBox.value;
+    } else {
+      payload.text = messageBox.value;
+    }
+
     fetch("/send", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN },
-      body: JSON.stringify({
-        to: document.getElementById("to").value,
-        from_name: document.getElementById("from_name").value,
-        from_local: localInput.value,
-        reply_to: document.getElementById("reply_to").value,
-        subject: document.getElementById("subject").value,
-        text: document.getElementById("message").value
-      })
+      body: JSON.stringify(payload)
     })
       .then(function (res) { return res.json(); })
       .then(function (data) {
@@ -690,6 +788,8 @@ function renderPage(domain, token) {
           statusBox.className = "status success";
           form.reset();
           updatePreview();
+          msgLabel.textContent = "Message";
+          exitPreview();
         } else {
           statusBox.textContent = "Error: " + (data.error || "Unknown error");
           statusBox.className = "status error";
@@ -717,12 +817,14 @@ function renderSentPage(rows, token) {
     ? rows
         .map(function (r) {
           const ok = r.status === "sent";
+          const isHtml = r.content_type === "html";
           return (
             '<details class="msg">' +
             "<summary>" +
             '<span class="dot ' + (ok ? "ok" : "fail") + '"></span>' +
             "<strong>" + escapeHtml(r.subject || "") + "</strong>" +
             '<span class="meta">to ' + escapeHtml(r.to_addresses || "") +
+            (isHtml ? " &middot; HTML" : "") +
             " &middot; " + escapeHtml(r.created_at || "") + " UTC</span>" +
             "</summary>" +
             '<div class="msg-body">' +
@@ -731,7 +833,11 @@ function renderSentPage(rows, token) {
             (r.resend_id ? "<p><strong>Resend ID:</strong> " + escapeHtml(r.resend_id) + "</p>" : "") +
             (r.delivery_status ? "<p><strong>Delivery:</strong> " + escapeHtml(r.delivery_status) + "</p>" : "") +
             (!ok && r.error ? '<p class="err"><strong>Error:</strong> ' + escapeHtml(r.error) + "</p>" : "") +
-            '<pre class="body">' + escapeHtml(r.body || "") + "</pre>" +
+            (isHtml
+              ? '<iframe class="preview" sandbox="" srcdoc="' + escapeHtml(r.body || "") + '"></iframe>' +
+                '<details class="src"><summary>Source</summary>' +
+                '<pre class="body">' + escapeHtml(r.body || "") + "</pre></details>"
+              : '<pre class="body">' + escapeHtml(r.body || "") + "</pre>") +
             "</div></details>"
           );
         })
@@ -743,7 +849,7 @@ function renderSentPage(rows, token) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sent Messages</title>
+<title>Sent Messages — Outbox</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -776,6 +882,23 @@ function renderSentPage(rows, token) {
   .msg-body { margin: 12px 0 4px 17px; font-size: 14px; }
   .msg-body p { margin: 4px 0; }
   .msg-body .err { color: #c0392b; }
+  iframe.preview {
+    width: 100%;
+    height: 220px;
+    border: 1px solid #e5e5e5;
+    border-radius: 6px;
+    background: #fff;
+    margin: 10px 0 0;
+    display: block;
+  }
+  details.src { margin-top: 10px; }
+  details.src summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: #888;
+    user-select: none;
+  }
+  details.src summary:hover { color: #1a1a1a; }
   pre.body {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -870,7 +993,7 @@ function renderUsagePage(stats, token) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>API Usage</title>
+<title>API Usage — Outbox</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -992,4 +1115,4 @@ function renderUsagePage(stats, token) {
 </script>
 </body>
 </html>`;
-      }
+}
