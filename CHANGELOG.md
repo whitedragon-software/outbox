@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+- Password protection: set a `PASSWORD` secret and every page sits behind
+  a login screen. A correct password sets a signed session cookie —
+  HttpOnly, Secure, SameSite=Lax, 30 days — whose signing key is derived
+  from the password, so changing the password invalidates every session
+  ever issued. A "Log out" button appears in the sidebar. `AUTH_TOKEN`
+  keeps working alongside it: either credential grants access, and
+  token-only setups behave exactly as before. With both unset the app
+  stays open; with `PASSWORD` set and no `AUTH_TOKEN`, `POST /send` and
+  `/usage/sync` need the session cookie.
+- Second sending domain: set an optional `DOMAIN2` var and the compose
+  form grows a domain picker next to the From address (the live preview
+  follows it); `POST /send` accepts an optional `from_domain`, validated
+  against the configured domains and defaulting to `DOMAIN1`. The sidebar
+  footer lists every configured domain. Single-domain setups are
+  unchanged.
+
+### Changed
+- Secret comparisons (`AUTH_TOKEN` in the header or query string, the
+  login password, the session cookie) are now constant-time — previously
+  a documented limitation. Failed logins also pause 500 ms.
+
 ## 0.6.0
 
 ### Added
