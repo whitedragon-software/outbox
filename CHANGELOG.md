@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- HTML email: a "Send as HTML" checkbox on the compose form, and `text`,
+  `html` or both in the `POST /send` API — when both are given, the plain
+  text is sent as the fallback part. Existing text-only calls are unchanged.
+- Preview on the compose page: the Preview button renders the message as
+  the recipient will see it — a sandboxed iframe for HTML (scripts blocked),
+  plain text otherwise — and toggles back to editing. Toggling the HTML
+  checkbox while previewing re-renders live.
+- The compose page title is now "Outbox".
+- `/sent` shows HTML messages as the rendered sandboxed preview
+  automatically; the raw source sits collapsed under a "Source" drop-down.
+  HTML messages are marked in the summary line.
+- `content_type` column, added by the same idempotent migration as
+  `delivery_status`. Rows imported from Resend during reconciliation are
+  typed by whether Resend had `text` or `html` for them.
+
 ## 0.4.0
 
 ### Added
