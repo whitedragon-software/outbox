@@ -1,9 +1,11 @@
 # Outbox
 
 A single-file Cloudflare Worker that sends email through Resend from your own
-domain: a white-background compose form with live HTML preview, a complete
-send history in D1 with rendered previews, and a usage dashboard that reads
-live from Resend so the numbers always match the provider's.
+domain: a compose form with live HTML preview, a complete send history in D1
+with rendered previews, and a usage dashboard that reads live from Resend so
+the numbers always match the provider's. All three pages share one dashboard
+shell — sidebar navigation on desktop, a top bar on mobile — with a
+light/dark theme toggle, light by default.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -88,8 +90,8 @@ keep working.
 
 Open the Worker's URL, fill in the form, send. The "From address" field is
 the local part only — the domain is always `DOMAIN1`, shown live in the hint
-under the field. Multiple recipients, comma-separated. Every attempt is
-logged, including failures with Resend's error message.
+under the field and in the sidebar. Multiple recipients, comma-separated.
+Every attempt is logged, including failures with Resend's error message.
 
 For HTML email, check *Send as HTML* and paste your markup into the message
 box, then press **Preview** to see it rendered exactly as the recipient
@@ -147,11 +149,17 @@ rather than breaking.
 **Previews.** Both the compose-page preview and the `/sent` history preview
 use an iframe with an empty `sandbox` attribute — scripts, forms and
 navigation inside the message cannot run. The message body is also
-HTML-escaped everywhere it appears outside those frames.
+HTML-escaped everywhere it appears outside those frames. Preview panes stay
+white in both themes: that is how the recipient sees the message.
 
-**Pages.** All three pages are inline HTML in the same file — white
-background, no external assets, no client-side dependencies. Inline scripts
-read `DOMAIN` and `TOKEN` from Worker-side interpolations.
+**Pages.** All three pages share one dashboard shell: sidebar navigation on
+desktop (current page highlighted, sending domain shown at the bottom) that
+collapses into a sticky top bar with tab navigation below 860 px, plus a
+light/dark theme toggle — light is the default, the choice is remembered
+per browser in localStorage, and the system color-scheme preference is
+deliberately not auto-detected. Everything is inline in the same file — no
+external assets, no client-side dependencies; the icons are inline SVG.
+Inline scripts read `DOMAIN` and `TOKEN` from Worker-side interpolations.
 
 ---
 
@@ -175,11 +183,13 @@ for i, s in enumerate(scripts):
 print(len(scripts), 'inline scripts extracted')
 PY
 
-node --check .page0.mjs
-node --check .page1.mjs
+for f in .page*.mjs; do node --check "$f"; done
+rm -f .page*.mjs
 ```
 
-The `${...}` substitutions (`DOMAIN`, `TOKEN`) are Worker-side interpolations —
+There are three inline scripts: the shared theme/sidebar script (no
+interpolations), the compose script and the usage script. The `${...}`
+substitutions (`DOMAIN`, `TOKEN`) are Worker-side interpolations —
 runtime-valid but invalid standalone JavaScript — so the extraction replaces
 them with `null` before checking.
 
@@ -199,13 +209,19 @@ them with `null` before checking.
    `/sent` with a red dot.
 6. With `AUTH_TOKEN` set: `/` without a token returns 401; `/?token=…`
    loads and the send button still works; `/sent` and `/usage` follow the
-   links without losing the token.
+   sidebar links without losing the token.
 7. Missing `RESEND_KEY` or `DOMAIN1`: a plain-text configuration error,
    not a 1102 crash.
 8. Check "Send as HTML", paste `<p><b>bold</b> and <i>italic</i></p>`, press
    Preview: the rendered text appears; "Back to editing" returns to the
    source. Send it: the email arrives formatted, and `/sent` shows the
    rendered preview with the source collapsed under the *Source* drop-down.
+9. Toggle *Dark mode* (sidebar on desktop, top bar on mobile): every page
+   switches theme, the button flips to *Light mode*, and reload keeps the
+   choice; rendered email previews stay white either way. Shrink the window
+   below ~860 px (or use the browser device toolbar): the sidebar collapses
+   into a sticky top bar with Compose / Sent / Usage tabs, and the usage
+   chart scrolls sideways instead of squashing its labels.
 
 ---
 
@@ -235,3 +251,7 @@ them with `null` before checking.
   writes to the local D1 copy, production to the remote one. Sends made in
   dev do not appear in the deployed `/sent` (they still show in `/usage`,
   since that reads from Resend).
+- Dark mode is a per-browser preference (localStorage): it does not sync
+  between devices, and with JavaScript disabled the pages stay light. The
+  system color-scheme preference is never auto-detected, so a dark-mode OS
+  still gets the light theme until you toggle.
