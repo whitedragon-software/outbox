@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+- Dark mode with a light default: a "Dark mode / Light mode" toggle in the
+  sidebar switches every page; the choice is remembered per browser in
+  localStorage. The system color-scheme preference is deliberately not
+  auto-detected — the first visit is always light. Light mode keeps the
+  original palette; dark mode uses contrast-adjusted equivalents of the
+  same green/red status colors.
+- Mobile support: below 860 px the sidebar collapses into a sticky top bar
+  (brand + theme toggle, with Compose / Sent / Usage as horizontally
+  scrollable tabs); the usage chart scrolls sideways instead of squashing
+  its date labels; stat cards and the delivery/recipients panels reflow to
+  one column.
+
+### Changed
+- Dashboard layout for all three pages: a persistent sidebar with the
+  current page highlighted, an Outbox brand mark, and the sending domain
+  shown at the bottom. Page content sits in the main area under its own
+  heading ("New message", "Sent messages", "API key usage") instead of a
+  lone centered card; the inter-page links moved into the sidebar.
+- All styling now runs on CSS custom properties so both themes share one
+  ruleset. Rendered email previews — the sandboxed iframes and the compose
+  plain-text preview — deliberately stay white in both themes: that is how
+  the recipient sees the message.
+
 ## 0.5.0
 
 ### Added
