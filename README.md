@@ -331,4 +331,3 @@ replaces them with `null` before checking.
   between devices, and with JavaScript disabled the pages stay light. The
   system color-scheme preference is never auto-detected, so a dark-mode OS
   still gets the light theme until you toggle.
-`````
