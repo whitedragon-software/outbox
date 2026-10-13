@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.1
+
+### Added
+- Domain management in the dashboard at `/domains`: the sending-domain
+  list lives in D1 (new `domains` table) and is edited there — add and
+  remove, with the first entry marked as the default. `DOMAIN1`/`DOMAIN2`
+  are imported into the list once on first run; afterwards the page is
+  the source of truth, and removing a domain really removes it. The
+  compose picker, the sidebar footer and `POST /send` validation all
+  follow the stored list; `from_domain` outside it is a 400 naming the
+  allowed domains. Removing the last remaining domain is refused.
+  JSON endpoints `POST /domains/add` and `POST /domains/remove`, authed
+  like the other POSTs. Without a DB binding, the environment variables
+  keep working directly, as before.
+
+### Changed
+- "Log out" in the sidebar is now a link to `GET /logout`, which clears
+  the session and returns to `/login`; `POST /logout` still works.
+- With no domains configured, the compose page shows an in-page
+  "add a domain" prompt instead of a plain error.
+
 ## 0.7.0
 
 ### Added
@@ -147,3 +168,4 @@
 - Optional `AUTH_TOKEN` protection: pages require `?token=…`, API calls
   the `X-Auth-Token` header. **Unset, everything behaves as before.**
 - Configuration: `RESEND_KEY` (secret), `DOMAIN1` (var).
+```
