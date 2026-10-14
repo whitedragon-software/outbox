@@ -1,6 +1,7 @@
 const RESEND_ENDPOINT = "https://api.resend.com/emails";
 const RESEND_LIST_LIMIT = 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DOMAIN_RE = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const MAX_RECIPIENTS = 50;
 
 // PASSWORD login sessions: 30-day signed cookies.
@@ -173,17 +174,84 @@ async function ensureSchema(env) {
   } catch (e) {
     if (!String(e.message || e).includes("duplicate column")) throw e;
   }
+
+  // The sending-domain list, managed on the /domains page.
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS domains (" +
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+      "domain TEXT NOT NULL UNIQUE, " +
+      "created_at TEXT NOT NULL DEFAULT (datetime('now'))" +
+      ")"
+  ).run();
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS settings (" +
+      "key TEXT PRIMARY KEY, " +
+      "value TEXT NOT NULL" +
+      ")"
+  ).run();
+  // One-time import of DOMAIN1/DOMAIN2 into that list. Afterwards the
+  // dashboard owns it: removing a domain there is final, and later edits
+  // to the variables do not re-add anything. Best-effort — a failed import
+  // retries on the next isolate.
+  try {
+    const seeded = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'domains_seeded'"
+    ).first();
+    if (!seeded) {
+      const initial = [];
+      if (env.DOMAIN1) initial.push(String(env.DOMAIN1).toLowerCase());
+      if (env.DOMAIN2) initial.push(String(env.DOMAIN2).toLowerCase());
+      for (const d of initial) {
+        await env.DB.prepare("INSERT OR IGNORE INTO domains (domain) VALUES (?)").bind(d).run();
+      }
+      if (initial.length > 0) {
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO settings (key, value) VALUES ('domains_seeded', '1')"
+        ).run();
+      }
+    }
+  } catch {}
+
   schemaReady = true;
+}
+
+// The effective sending-domain list, the default first: the D1 `domains`
+// table (plus the 'default_domain' setting) when a database is bound,
+// otherwise the environment variables directly.
+async function getDomains(env) {
+  if (env.DB) {
+    await ensureSchema(env);
+    try {
+      const r = await env.DB.prepare("SELECT domain FROM domains ORDER BY id ASC").all();
+      if (r && r.results) {
+        const list = r.results.map(function (row) { return row.domain; });
+        try {
+          const def = await env.DB.prepare(
+            "SELECT value FROM settings WHERE key = 'default_domain'"
+          ).first();
+          if (def && def.value && list.indexOf(def.value) !== -1 && list[0] !== def.value) {
+            return [def.value].concat(
+              list.filter(function (d) { return d !== def.value; })
+            );
+          }
+        } catch {}
+        return list;
+      }
+    } catch {}
+  }
+  const fromEnv = [];
+  if (env.DOMAIN1) fromEnv.push(String(env.DOMAIN1).toLowerCase());
+  if (env.DOMAIN2) fromEnv.push(String(env.DOMAIN2).toLowerCase());
+  return fromEnv;
 }
 
 // --- Routing ------------------------------------------------------------
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const domains = env.DOMAIN2 ? [env.DOMAIN1, env.DOMAIN2] : [env.DOMAIN1];
     const showLogout = !!env.PASSWORD;
 
-    // Login / logout (only active when PASSWORD is set)
+    // Login (only active when PASSWORD is set)
     if (url.pathname === "/login") {
       if (!env.PASSWORD) return redirect("/");
 
@@ -227,7 +295,9 @@ export default {
       }
     }
 
-    if (request.method === "POST" && url.pathname === "/logout") {
+    // Log out: clears the session cookie and returns to the login page.
+    // GET is what the sidebar link uses; POST is kept for older callers.
+    if (url.pathname === "/logout" && (request.method === "GET" || request.method === "POST")) {
       return new Response(null, {
         status: 303,
         headers: {
@@ -240,9 +310,9 @@ export default {
 
     // The email form
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      if (!env.RESEND_KEY || !env.DOMAIN1) {
+      if (!env.RESEND_KEY) {
         return new Response(
-          "Worker is not configured. Set the RESEND_KEY and DOMAIN1 environment variables.",
+          "Worker is not configured. Set the RESEND_KEY environment variable.",
           { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
         );
       }
@@ -250,6 +320,30 @@ export default {
       const denied = await requirePage(request, env, url);
       if (denied) return denied;
       const token = url.searchParams.get("token") || "";
+      const domains = await getDomains(env);
+
+      if (domains.length === 0) {
+        const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+        const content =
+          '<div class="page-head"><h1>New message</h1>' +
+          '<p class="sub">Delivered via Resend</p></div>' +
+          '<div class="card">' +
+          '<div class="warn">No sending domains are configured yet.</div>' +
+          '<p class="muted">Add your first domain to start sending.</p>' +
+          '<a class="btn" href="/domains' + tokenParam + '">Add a domain</a>' +
+          "</div>";
+        return new Response(
+          renderShell({
+            title: "Outbox",
+            active: "compose",
+            token: token,
+            domains: domains,
+            showLogout: showLogout,
+            content: content,
+          }),
+          { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+        );
+      }
 
       return new Response(renderPage(domains, token, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
@@ -280,6 +374,7 @@ export default {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
 
+      const domains = await getDomains(env);
       return new Response(renderSentPage(rows, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
@@ -322,6 +417,7 @@ export default {
           "Could not read from Resend (" + resend.error + ") — showing local database stats instead.";
       }
 
+      const domains = await getDomains(env);
       return new Response(renderUsagePage(stats, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
@@ -342,6 +438,154 @@ export default {
       await ensureSchema(env);
       const result = await syncDeliveryStatuses(env);
       return json({ success: true, checked: result.checked, byStatus: result.byStatus });
+    }
+
+    // Domain management page
+    if (request.method === "GET" && url.pathname === "/domains") {
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
+      const token = url.searchParams.get("token") || "";
+      if (!env.DB) {
+        return new Response(
+          "Domain management needs a D1 database bound as DB. Without one, the DOMAIN1/DOMAIN2 variables are used directly.",
+          { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+        );
+      }
+
+      const domains = await getDomains(env);
+      return new Response(renderDomainsPage(domains, token, showLogout), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+
+    // Add a sending domain
+    if (request.method === "POST" && url.pathname === "/domains/add") {
+      if (!(await isAuthorized(request, env))) {
+        return json({ success: false, error: "Unauthorized." }, 401);
+      }
+      if (!env.DB) {
+        return json({ success: false, error: "No D1 database is bound as DB." }, 500);
+      }
+      await ensureSchema(env);
+
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ success: false, error: "Request body must be valid JSON." }, 400);
+      }
+
+      const domain = String((body && body.domain) || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\.$/, "");
+      if (!DOMAIN_RE.test(domain) || domain.length > 253) {
+        return json(
+          { success: false, error: "That does not look like a domain (e.g. example.com)." },
+          400
+        );
+      }
+
+      try {
+        const existing = await env.DB.prepare("SELECT id FROM domains WHERE domain = ?")
+          .bind(domain)
+          .first();
+        if (existing) {
+          return json({ success: false, error: domain + " is already on the list." }, 400);
+        }
+        await env.DB.prepare("INSERT INTO domains (domain) VALUES (?)").bind(domain).run();
+      } catch (err) {
+        return json({ success: false, error: "Could not save the domain: " + err.message }, 500);
+      }
+      return json({ success: true, domain: domain });
+    }
+
+    // Remove a sending domain (the last one is refused — compose needs it)
+    if (request.method === "POST" && url.pathname === "/domains/remove") {
+      if (!(await isAuthorized(request, env))) {
+        return json({ success: false, error: "Unauthorized." }, 401);
+      }
+      if (!env.DB) {
+        return json({ success: false, error: "No D1 database is bound as DB." }, 500);
+      }
+      await ensureSchema(env);
+
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ success: false, error: "Request body must be valid JSON." }, 400);
+      }
+
+      const domain = String((body && body.domain) || "").trim().toLowerCase();
+      if (!domain) {
+        return json({ success: false, error: "Which domain?" }, 400);
+      }
+
+      try {
+        const countRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM domains").first();
+        if (countRow && countRow.c && countRow.c <= 1) {
+          return json(
+            { success: false, error: "At least one domain must remain — add another before removing this one." },
+            400
+          );
+        }
+        const result = await env.DB.prepare("DELETE FROM domains WHERE domain = ?")
+          .bind(domain)
+          .run();
+        if (!result.meta || !result.meta.changes) {
+          return json({ success: false, error: domain + " is not on the list." }, 400);
+        }
+      } catch (err) {
+        return json({ success: false, error: "Could not update the list: " + err.message }, 500);
+      }
+      // If the default domain was just removed, the setting is dropped so
+      // the oldest entry takes over. Best-effort.
+      try {
+        await env.DB.prepare(
+          "DELETE FROM settings WHERE key = 'default_domain' AND value = ?"
+        ).bind(domain).run();
+      } catch {}
+      return json({ success: true });
+    }
+
+    // Set the default sending domain
+    if (request.method === "POST" && url.pathname === "/domains/default") {
+      if (!(await isAuthorized(request, env))) {
+        return json({ success: false, error: "Unauthorized." }, 401);
+      }
+      if (!env.DB) {
+        return json({ success: false, error: "No D1 database is bound as DB." }, 500);
+      }
+      await ensureSchema(env);
+
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ success: false, error: "Request body must be valid JSON." }, 400);
+      }
+
+      const domain = String((body && body.domain) || "").trim().toLowerCase();
+      if (!domain) {
+        return json({ success: false, error: "Which domain?" }, 400);
+      }
+
+      try {
+        const existing = await env.DB.prepare("SELECT id FROM domains WHERE domain = ?")
+          .bind(domain)
+          .first();
+        if (!existing) {
+          return json({ success: false, error: domain + " is not on the list." }, 400);
+        }
+        await env.DB.prepare("DELETE FROM settings WHERE key = 'default_domain'").run();
+        await env.DB.prepare(
+          "INSERT INTO settings (key, value) VALUES ('default_domain', ?)"
+        ).bind(domain).run();
+      } catch (err) {
+        return json({ success: false, error: "Could not save the default: " + err.message }, 500);
+      }
+      return json({ success: true });
     }
 
     // The send endpoint
@@ -380,10 +624,16 @@ async function handleSend(request, env) {
     String(body.from_local || "noreply").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "") ||
     "noreply";
 
-  // The sending domain must be one the operator configured.
-  const allowedDomains = [String(env.DOMAIN1 || "").toLowerCase()];
-  if (env.DOMAIN2) allowedDomains.push(String(env.DOMAIN2).toLowerCase());
-  const fromDomain = String(body.from_domain || env.DOMAIN1 || "").trim().toLowerCase();
+  // The sending domain must be on the stored list (or the env fallback
+  // when no database is bound). The first entry is the default.
+  const allowedDomains = await getDomains(env);
+  if (allowedDomains.length === 0) {
+    return json(
+      { success: false, error: "No sending domains are configured (see the Domains page, or the DOMAIN1 variable)." },
+      400
+    );
+  }
+  const fromDomain = String(body.from_domain || allowedDomains[0]).trim().toLowerCase();
   if (!allowedDomains.includes(fromDomain)) {
     return json(
       { success: false, error: "from_domain must be one of: " + allowedDomains.join(", ") + "." },
@@ -750,10 +1000,10 @@ async function syncDeliveryStatuses(env) {
 }
 
 // --- Pages: shared dashboard shell --------------------------------------
-// All three pages render through renderShell(): sidebar navigation on
-// desktop that collapses into a sticky top bar with tab navigation below
-// 860px, plus a light/dark theme toggle. Light is the default; the choice
-// is stored per browser in localStorage ("outbox-theme"); the system
+// All pages render through renderShell(): sidebar navigation on desktop
+// that collapses into a sticky top bar with tab navigation below 860px,
+// plus a light/dark theme toggle. Light is the default; the choice is
+// stored per browser in localStorage ("outbox-theme"); the system
 // color-scheme preference is deliberately not auto-detected. All colors go
 // through CSS custom properties. Rendered email previews (the sandboxed
 // iframes and the plain-text preview) deliberately stay white in both
@@ -776,6 +1026,11 @@ const ICON_USAGE =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>';
+const ICON_DOMAINS =
+  '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/>' +
+  '<path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
 const ICON_MOON =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -955,7 +1210,6 @@ const SHARED_CSS = `
   .theme-toggle .when-dark { display: none; align-items: center; gap: 9px; }
   html:not([data-theme="dark"]) .theme-toggle .when-light { display: flex; }
   html[data-theme="dark"] .theme-toggle .when-dark { display: flex; }
-  .logout-form { margin: 0; }
   .logout-btn {
     display: flex;
     align-items: center;
@@ -969,6 +1223,7 @@ const SHARED_CSS = `
     font: inherit;
     font-size: 13.5px;
     font-weight: 500;
+    text-decoration: none;
     cursor: pointer;
   }
   .logout-btn:hover { background: var(--ghost-hover); }
@@ -1017,6 +1272,7 @@ const SHARED_CSS = `
   .btn.small { padding: 8px 14px; font-size: 13px; }
   .btn.ghost { color: var(--fg); background: var(--ghost-bg); border-color: var(--border-strong); }
   .btn.ghost:hover:not(:disabled) { background: var(--ghost-hover); border-color: var(--border-strong); }
+  a.btn { display: inline-block; text-decoration: none; }
 
   label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
   input, textarea, select {
@@ -1113,15 +1369,15 @@ function renderShell(o) {
   const nav =
     navLink("/" + tokenParam, "compose", "Compose", ICON_COMPOSE) +
     navLink("/sent" + tokenParam, "sent", "Sent", ICON_SENT) +
-    navLink("/usage" + tokenParam, "usage", "Usage", ICON_USAGE);
+    navLink("/usage" + tokenParam, "usage", "Usage", ICON_USAGE) +
+    navLink("/domains" + tokenParam, "domains", "Domains", ICON_DOMAINS);
   const footDomains = (o.domains || [])
     .map(function (d) { return '<div class="foot-domain">' + escapeHtml(d) + "</div>"; })
     .join("");
   const foot = '<div class="side-foot">' + footDomains + "delivered via Resend</div>";
   const logout = o.showLogout
-    ? '<form method="post" action="/logout" class="logout-form">' +
-      '<button type="submit" class="logout-btn" aria-label="Log out">' +
-      ICON_LOGOUT + '<span class="btn-label">Log out</span></button></form>'
+    ? '<a class="logout-btn" href="/logout">' +
+      ICON_LOGOUT + '<span class="btn-label">Log out</span></a>'
     : "";
 
   return `<!DOCTYPE html>
@@ -1212,26 +1468,28 @@ function renderLoginPage(next, error) {
 }
 
 function renderPage(domains, token, showLogout) {
-  const domain1 = domains[0];
-  const domain2 = domains.length > 1 ? domains[1] : null;
   const domainsJson = JSON.stringify(domains).replace(/</g, "\\u003c");
   const tokenJson = JSON.stringify(token || "").replace(/</g, "\\u003c");
 
-  // With a second domain configured, the From field grows a picker; with
-  // one domain the markup is exactly what it always was.
-  const fromControl = domain2
+  // The picker appears with two or more domains; the first is the default.
+  const domainOptions = domains
+    .map(function (d, i) {
+      return (
+        '<option value="' + escapeHtml(d) + '"' + (i === 0 ? " selected" : "") + ">" +
+        escapeHtml(d) + "</option>"
+      );
+    })
+    .join("");
+  const fromControl = domains.length > 1
     ? '<div class="from-row">' +
       '<input id="from_local" type="text" value="noreply">' +
-      '<select id="from_domain" aria-label="Sending domain">' +
-      '<option value="' + escapeHtml(domain1) + '" selected>' + escapeHtml(domain1) + "</option>" +
-      '<option value="' + escapeHtml(domain2) + '">' + escapeHtml(domain2) + "</option>" +
-      "</select></div>"
+      '<select id="from_domain" aria-label="Sending domain">' + domainOptions + "</select></div>"
     : '<input id="from_local" type="text" value="noreply">';
 
   const content = `
 <div class="page-head">
   <h1>New message</h1>
-  <p class="sub">Delivered via Resend, from your verified domain.</p>
+  <p class="sub">Delivered via Resend</p>
 </div>
 <div class="card">
   <form id="send-form">
@@ -1418,6 +1676,147 @@ function renderPage(domains, token, showLogout) {
   });
 }
 
+function renderDomainsPage(domains, token, showLogout) {
+  const tokenJson = JSON.stringify(token || "").replace(/</g, "\\u003c");
+
+  const listHtml = domains.length
+    ? domains
+        .map(function (d, i) {
+          const isDefault = i === 0;
+          return (
+            '<div class="domain-row">' +
+            '<div class="domain-left">' +
+            '<span class="domain-name">' + escapeHtml(d) + "</span>" +
+            (isDefault ? '<span class="default-pill">default</span>' : "") +
+            "</div>" +
+            '<div class="domain-actions">' +
+            (isDefault
+              ? ""
+              : '<button type="button" class="btn ghost small default-btn" data-domain="' +
+                escapeHtml(d) + '">Set default</button>') +
+            '<button type="button" class="btn ghost small remove-btn" data-domain="' +
+            escapeHtml(d) + '">Remove</button>' +
+            "</div>" +
+            "</div>"
+          );
+        })
+        .join("")
+    : '<p class="muted">No domains yet — add the first one above.</p>';
+
+  const content = `
+<div class="page-head">
+  <h1>Domains</h1>
+</div>
+<div class="card">
+  <form id="add-form">
+    <label for="add-domain">Add a domain</label>
+    <div class="add-row">
+      <input id="add-domain" type="text" placeholder="example.com" autocomplete="off" spellcheck="false">
+      <button id="add-btn" type="submit" class="btn">Add</button>
+    </div>
+  </form>
+  <div class="status" id="status"></div>
+  <div class="domain-list">${listHtml}</div>
+</div>`;
+
+  const extraCss = `
+  .add-row { display: flex; gap: 8px; }
+  .add-row input { flex: 1; min-width: 0; }
+  .add-row .btn { flex: none; }
+  .domain-list { margin-top: 18px; }
+  .domain-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .domain-row:last-child { border-bottom: none; }
+  .domain-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+  .domain-name { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+  .domain-actions { display: flex; gap: 8px; flex: none; flex-wrap: wrap; }
+  .default-pill {
+    border: 1px solid var(--border-strong);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+`;
+
+  const script = `<script>
+(function () {
+  var TOKEN = ${tokenJson};
+  var form = document.getElementById("add-form");
+  var input = document.getElementById("add-domain");
+  var addBtn = document.getElementById("add-btn");
+  var statusBox = document.getElementById("status");
+
+  function setStatus(msg, cls) {
+    statusBox.textContent = msg;
+    statusBox.className = "status" + (cls ? " " + cls : "");
+  }
+
+  function post(path, payload, btn, onDone) {
+    if (btn) btn.disabled = true;
+    fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN },
+      body: JSON.stringify(payload)
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (btn) btn.disabled = false;
+        if (data.success) { onDone(); return; }
+        setStatus("Error: " + (data.error || "Unknown error"), "error");
+      })
+      .catch(function (err) {
+        if (btn) btn.disabled = false;
+        setStatus("Error: " + err.message, "error");
+      });
+  }
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var domain = (input.value || "").trim();
+    if (!domain) return;
+    post("/domains/add", { domain: domain }, addBtn, function () { location.reload(); });
+  });
+
+  function wire(sel, path) {
+    var btns = document.querySelectorAll(sel);
+    for (var i = 0; i < btns.length; i++) {
+      (function (btn) {
+        btn.addEventListener("click", function () {
+          post(path, { domain: btn.getAttribute("data-domain") }, btn, function () {
+            location.reload();
+          });
+        });
+      })(btns[i]);
+    }
+  }
+  wire(".remove-btn", "/domains/remove");
+  wire(".default-btn", "/domains/default");
+})();
+</script>`;
+
+  return renderShell({
+    title: "Domains — Outbox",
+    active: "domains",
+    token: token,
+    domains: domains,
+    showLogout: showLogout,
+    width: "narrow",
+    content: content,
+    extraCss: extraCss,
+    script: script,
+  });
+}
+
 function renderSentPage(rows, token, domains, showLogout) {
   const items = rows.length
     ? rows
@@ -1565,7 +1964,7 @@ function renderUsagePage(stats, token, domains, showLogout) {
     : '<span class="muted">No recipients yet.</span>';
 
   const sub = isResend
-    ? "Live from Resend — every email sent with this API key, straight from the provider."
+    ? "Live from Resend"
     : "Local database stats (Resend was unreachable).";
 
   const content =
