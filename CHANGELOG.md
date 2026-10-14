@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.2
+
+### Added
+- Default-domain setting: "Set default" on any non-default row at
+  `/domains` (stored in the `settings` table). The default is the domain
+  preselected in the compose picker and assumed when `POST /send` omits
+  `from_domain`. `POST /domains/default` with `{"domain":"example.com"}`
+  does it programmatically. Removing the default domain falls back to the
+  oldest entry.
+
+### Changed
+- Domains are configured only in the dashboard: the `DOMAIN1`/`DOMAIN2`
+  variables no longer feed the list in any way — add domains at
+  `/domains`. Lists seeded by earlier versions keep what they have.
+- Trimmed page taglines: compose reads "Delivered via Resend", the usage
+  dashboard "Live from Resend", and the Domains page dropped its explainer
+  lines.
+- Efficiency: `/usage` runs reconciliation, the rejected count and the
+  domain read concurrently; `/sent` reads history and domains together;
+  reconciliation looks up only the resend IDs present in Resend's list
+  instead of every logged send; the delivery sync checks its 25 emails
+  concurrently in batches of five (rate-limit friendly); `/send` runs its
+  cheap validation before touching the database; the D1 fallback counts
+  run in parallel.
+- `/domains` without a DB binding now renders the page with a notice
+  instead of a bare error, so the flow never dead-ends.
+
 ## 0.7.1
 
 ### Added
@@ -168,4 +195,3 @@
 - Optional `AUTH_TOKEN` protection: pages require `?token=…`, API calls
   the `X-Auth-Token` header. **Unset, everything behaves as before.**
 - Configuration: `RESEND_KEY` (secret), `DOMAIN1` (var).
-```
