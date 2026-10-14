@@ -175,7 +175,8 @@ async function ensureSchema(env) {
     if (!String(e.message || e).includes("duplicate column")) throw e;
   }
 
-  // The sending-domain list, managed on the /domains page.
+  // The sending-domain list and settings, managed on the /domains page.
+  // Domains are never imported from environment variables.
   await env.DB.prepare(
     "CREATE TABLE IF NOT EXISTS domains (" +
       "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
@@ -189,60 +190,25 @@ async function ensureSchema(env) {
       "value TEXT NOT NULL" +
       ")"
   ).run();
-  // One-time import of DOMAIN1/DOMAIN2 into that list. Afterwards the
-  // dashboard owns it: removing a domain there is final, and later edits
-  // to the variables do not re-add anything. Best-effort — a failed import
-  // retries on the next isolate.
-  try {
-    const seeded = await env.DB.prepare(
-      "SELECT value FROM settings WHERE key = 'domains_seeded'"
-    ).first();
-    if (!seeded) {
-      const initial = [];
-      if (env.DOMAIN1) initial.push(String(env.DOMAIN1).toLowerCase());
-      if (env.DOMAIN2) initial.push(String(env.DOMAIN2).toLowerCase());
-      for (const d of initial) {
-        await env.DB.prepare("INSERT OR IGNORE INTO domains (domain) VALUES (?)").bind(d).run();
-      }
-      if (initial.length > 0) {
-        await env.DB.prepare(
-          "INSERT OR IGNORE INTO settings (key, value) VALUES ('domains_seeded', '1')"
-        ).run();
-      }
-    }
-  } catch {}
 
   schemaReady = true;
 }
 
-// The effective sending-domain list, the default first: the D1 `domains`
-// table (plus the 'default_domain' setting) when a database is bound,
-// otherwise the environment variables directly.
+// The effective sending-domain list, the default first. Read from D1 in a
+// single query; empty until domains are added at /domains. Without a DB
+// binding there are no domains (the /domains page says so).
 async function getDomains(env) {
-  if (env.DB) {
-    await ensureSchema(env);
-    try {
-      const r = await env.DB.prepare("SELECT domain FROM domains ORDER BY id ASC").all();
-      if (r && r.results) {
-        const list = r.results.map(function (row) { return row.domain; });
-        try {
-          const def = await env.DB.prepare(
-            "SELECT value FROM settings WHERE key = 'default_domain'"
-          ).first();
-          if (def && def.value && list.indexOf(def.value) !== -1 && list[0] !== def.value) {
-            return [def.value].concat(
-              list.filter(function (d) { return d !== def.value; })
-            );
-          }
-        } catch {}
-        return list;
-      }
-    } catch {}
-  }
-  const fromEnv = [];
-  if (env.DOMAIN1) fromEnv.push(String(env.DOMAIN1).toLowerCase());
-  if (env.DOMAIN2) fromEnv.push(String(env.DOMAIN2).toLowerCase());
-  return fromEnv;
+  if (!env.DB) return [];
+  await ensureSchema(env);
+  try {
+    const r = await env.DB.prepare(
+      "SELECT d.domain FROM domains d " +
+      "LEFT JOIN settings s ON s.key = 'default_domain' AND s.value = d.domain " +
+      "ORDER BY CASE WHEN s.value IS NOT NULL THEN 0 ELSE 1 END, d.id ASC"
+    ).all();
+    if (r && r.results) return r.results.map(function (row) { return row.domain; });
+  } catch {}
+  return [];
 }
 
 // --- Routing ------------------------------------------------------------
@@ -364,17 +330,20 @@ export default {
 
       await ensureSchema(env);
 
+      // History and the domain list are independent — read both at once.
       let rows = [];
+      let domains = [];
       try {
-        const result = await env.DB.prepare(
-          "SELECT * FROM emails ORDER BY id DESC LIMIT 200"
-        ).all();
+        const [result, domainList] = await Promise.all([
+          env.DB.prepare("SELECT * FROM emails ORDER BY id DESC LIMIT 200").all(),
+          getDomains(env),
+        ]);
         rows = result.results || [];
+        domains = domainList;
       } catch (err) {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
 
-      const domains = await getDomains(env);
       return new Response(renderSentPage(rows, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
@@ -396,28 +365,26 @@ export default {
 
       const resend = await getResendStats(env);
       let stats;
+      let domains;
 
       if (resend.ok) {
-        if (env.DB) await reconcileFromResend(env, resend.list);
-
+        // Reconciliation, the rejected count and the domain list are
+        // independent — run them concurrently, not one after another.
+        const settled = await Promise.all([
+          env.DB ? reconcileFromResend(env, resend.list) : Promise.resolve(),
+          getDomains(env),
+          countRejected(env),
+        ]);
+        domains = settled[1];
         stats = resend.stats;
-        let failed = 0;
-        if (env.DB) {
-          try {
-            const r = await env.DB.prepare(
-              "SELECT COUNT(*) AS c FROM emails WHERE status = 'failed'"
-            ).first();
-            failed = r && r.c ? r.c : 0;
-          } catch {}
-        }
-        stats.cards.push({ num: failed, lbl: "Rejected (worker log)", bad: true });
+        stats.cards.push({ num: settled[2], lbl: "Rejected (worker log)", bad: true });
       } else {
         stats = env.DB ? await getD1Stats(env) : emptyStats();
         stats.warning =
           "Could not read from Resend (" + resend.error + ") — showing local database stats instead.";
+        domains = await getDomains(env);
       }
 
-      const domains = await getDomains(env);
       return new Response(renderUsagePage(stats, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
@@ -445,10 +412,26 @@ export default {
       const denied = await requirePage(request, env, url);
       if (denied) return denied;
       const token = url.searchParams.get("token") || "";
+
+      // Without a DB binding nothing can be managed — but show the page
+      // with a notice instead of a dead 500, so the flow never dead-ends.
       if (!env.DB) {
+        const content =
+          '<div class="page-head"><h1>Domains</h1></div>' +
+          '<div class="card">' +
+          '<div class="warn">Domain management needs a D1 database bound as DB.</div>' +
+          '<p class="muted">Bind a database, then add your sending domains here.</p>' +
+          "</div>";
         return new Response(
-          "Domain management needs a D1 database bound as DB. Without one, the DOMAIN1/DOMAIN2 variables are used directly.",
-          { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+          renderShell({
+            title: "Domains — Outbox",
+            active: "domains",
+            token: token,
+            domains: [],
+            showLogout: showLogout,
+            content: content,
+          }),
+          { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
         );
       }
 
@@ -624,23 +607,8 @@ async function handleSend(request, env) {
     String(body.from_local || "noreply").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "") ||
     "noreply";
 
-  // The sending domain must be on the stored list (or the env fallback
-  // when no database is bound). The first entry is the default.
-  const allowedDomains = await getDomains(env);
-  if (allowedDomains.length === 0) {
-    return json(
-      { success: false, error: "No sending domains are configured (see the Domains page, or the DOMAIN1 variable)." },
-      400
-    );
-  }
-  const fromDomain = String(body.from_domain || allowedDomains[0]).trim().toLowerCase();
-  if (!allowedDomains.includes(fromDomain)) {
-    return json(
-      { success: false, error: "from_domain must be one of: " + allowedDomains.join(", ") + "." },
-      400
-    );
-  }
-
+  // Cheap validation first — nothing below touches the database until the
+  // payload is otherwise well-formed.
   if (recipients.length === 0 || !recipients.every((e) => EMAIL_RE.test(e))) {
     return json({ success: false, error: "Please provide valid recipient email address(es)." }, 400);
   }
@@ -653,6 +621,23 @@ async function handleSend(request, env) {
   }
   if (replyTo && !EMAIL_RE.test(replyTo)) {
     return json({ success: false, error: "Reply-To must be a valid email address." }, 400);
+  }
+
+  // The sending domain must be on the stored list; the first entry is the
+  // default. One DB read, only for valid payloads.
+  const allowedDomains = await getDomains(env);
+  if (allowedDomains.length === 0) {
+    return json(
+      { success: false, error: "No sending domains are configured — add one on the Domains page." },
+      400
+    );
+  }
+  const fromDomain = String(body.from_domain || allowedDomains[0]).trim().toLowerCase();
+  if (!allowedDomains.includes(fromDomain)) {
+    return json(
+      { success: false, error: "from_domain must be one of: " + allowedDomains.join(", ") + "." },
+      400
+    );
   }
 
   const from = fromName
@@ -812,11 +797,25 @@ async function getResendStats(env) {
 async function reconcileFromResend(env, list) {
   if (!env.DB || !Array.isArray(list)) return;
   try {
-    const r = await env.DB.prepare(
-      "SELECT id, resend_id, delivery_status FROM emails WHERE resend_id IS NOT NULL"
-    ).all();
+    // Only the resend IDs present in this list can match anything — look
+    // up exactly those rows (in chunks) instead of every send ever logged.
+    const ids = [];
+    for (const e of list) {
+      if (e && e.id) ids.push(String(e.id));
+    }
+    if (ids.length === 0) return;
+
     const existing = {};
-    for (const row of r.results || []) existing[row.resend_id] = row;
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      const placeholders = chunk.map(function () { return "?"; }).join(",");
+      const r = await env.DB.prepare(
+        "SELECT id, resend_id, delivery_status FROM emails WHERE resend_id IN (" + placeholders + ")"
+      )
+        .bind(...chunk)
+        .all();
+      for (const row of r.results || []) existing[row.resend_id] = row;
+    }
 
     for (const e of list) {
       if (!e || !e.id) continue;
@@ -866,6 +865,20 @@ async function reconcileFromResend(env, list) {
   }
 }
 
+// "Rejected (worker log)": attempts Resend refused outright — they never
+// enter Resend's list, so only the worker saw them.
+async function countRejected(env) {
+  if (!env.DB) return 0;
+  try {
+    const r = await env.DB.prepare(
+      "SELECT COUNT(*) AS c FROM emails WHERE status = 'failed'"
+    ).first();
+    return r && r.c ? r.c : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // --- D1 fallback stats (used only if Resend is unreachable) -------------
 async function getD1Stats(env) {
   const scalar = async (sql) => {
@@ -877,15 +890,20 @@ async function getD1Stats(env) {
     }
   };
 
-  const total = await scalar("SELECT COUNT(*) AS c FROM emails");
-  const sent = await scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'sent'");
-  const failed = await scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'failed'");
-  const last24h = await scalar(
-    "SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-1 day')");
-  const last7d = await scalar(
-    "SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-7 days')");
-  const last30d = await scalar(
-    "SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-30 days')");
+  const counts = await Promise.all([
+    scalar("SELECT COUNT(*) AS c FROM emails"),
+    scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'sent'"),
+    scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'failed'"),
+    scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-1 day')"),
+    scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-7 days')"),
+    scalar("SELECT COUNT(*) AS c FROM emails WHERE status = 'sent' AND created_at >= datetime('now', '-30 days')"),
+  ]);
+  const total = counts[0];
+  const sent = counts[1];
+  const failed = counts[2];
+  const last24h = counts[3];
+  const last7d = counts[4];
+  const last30d = counts[5];
 
   const perDayMap = {};
   try {
@@ -908,7 +926,7 @@ async function getD1Stats(env) {
     perDay.push({ day: key, count: entry ? entry.c : 0, failed: entry ? entry.f : 0 });
   }
 
-  const counts = {};
+  const recipCounts = {};
   try {
     const r = await env.DB.prepare(
       "SELECT to_addresses FROM emails ORDER BY id DESC LIMIT 500"
@@ -916,12 +934,12 @@ async function getD1Stats(env) {
     for (const row of r.results || []) {
       for (const addr of String(row.to_addresses || "").split(",")) {
         const a = addr.trim();
-        if (a) counts[a] = (counts[a] || 0) + 1;
+        if (a) recipCounts[a] = (recipCounts[a] || 0) + 1;
       }
     }
   } catch {}
-  const topRecipients = Object.keys(counts)
-    .map(function (k) { return [k, counts[k]]; })
+  const topRecipients = Object.keys(recipCounts)
+    .map(function (k) { return [k, recipCounts[k]]; })
     .sort(function (a, b) { return b[1] - a[1]; })
     .slice(0, 5);
 
@@ -966,6 +984,8 @@ function emptyStats() {
 
 // Checks the 25 most recent sent emails against Resend's API and records
 // their latest delivery event (delivered / bounced / complained / ...).
+// The lookups are independent — they run concurrently, in batches of five
+// to stay friendly to Resend's rate limits.
 async function syncDeliveryStatuses(env) {
   let results = [];
   try {
@@ -978,23 +998,28 @@ async function syncDeliveryStatuses(env) {
 
   let checked = 0;
   const byStatus = {};
-  for (const row of results) {
-    try {
-      const res = await fetch(
-        "https://api.resend.com/emails/" + encodeURIComponent(row.resend_id),
-        { headers: { Authorization: "Bearer " + env.RESEND_KEY } }
-      );
-      if (!res.ok) continue;
-      const body = await res.json().catch(() => null);
-      const d = body && body.data ? body.data : body;
-      const ev = d && (d.last_event || d.status) ? (d.last_event || d.status) : "unknown";
-      await env.DB.prepare("UPDATE emails SET delivery_status = ? WHERE id = ?")
-        .bind(ev, row.id).run();
-      checked++;
-      byStatus[ev] = (byStatus[ev] || 0) + 1;
-    } catch {
-      // Skip this email and keep going
-    }
+  for (let i = 0; i < results.length; i += 5) {
+    const batch = results.slice(i, i + 5);
+    await Promise.all(
+      batch.map(async function (row) {
+        try {
+          const res = await fetch(
+            "https://api.resend.com/emails/" + encodeURIComponent(row.resend_id),
+            { headers: { Authorization: "Bearer " + env.RESEND_KEY } }
+          );
+          if (!res.ok) return;
+          const body = await res.json().catch(() => null);
+          const d = body && body.data ? body.data : body;
+          const ev = d && (d.last_event || d.status) ? (d.last_event || d.status) : "unknown";
+          await env.DB.prepare("UPDATE emails SET delivery_status = ? WHERE id = ?")
+            .bind(ev, row.id).run();
+          checked++;
+          byStatus[ev] = (byStatus[ev] || 0) + 1;
+        } catch {
+          // Skip this email and keep going
+        }
+      })
+    );
   }
   return { checked, byStatus };
 }
@@ -2070,4 +2095,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-}
+       }
