@@ -6,7 +6,8 @@ with rendered previews, and a usage dashboard that reads live from Resend so
 the numbers always match the provider's. All four pages share one dashboard
 shell — sidebar navigation on desktop, a top bar on mobile — with a
 light/dark theme toggle, light by default. Optional password login; the
-sending-domain list lives in the database and is managed from the dashboard.
+sending-domain list lives in the database and is managed entirely from the
+dashboard.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -25,10 +26,10 @@ https://outbox.<username>.workers.dev/
 
 Paste `_worker.js` into the Worker editor in the Cloudflare dashboard:
 create a Worker, replace the boilerplate with the file's contents, then add
-under Settings the variables `RESEND_KEY` (as an encrypted secret) and
-`DOMAIN1` (plain text), a D1 binding named `DB` (send history and the
-sending-domain list), and — optionally — a `PASSWORD` secret (login
-screen). Done — no config file, no CLI. The free tier is enough.
+under Settings the `RESEND_KEY` secret and a D1 binding named `DB` — and,
+optionally, a `PASSWORD` secret (login screen). Deploy, open the Worker's
+URL, go to **Domains**, and add your first sending domain. Done — no config
+file, no CLI. The free tier is enough.
 
 Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 
@@ -37,12 +38,7 @@ Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
   "name": "outbox",
   "main": "_worker.js",
   "compatibility_date": "2024-09-01",
-  "vars": {
-    // seeds the /domains list on first run; must be verified in Resend
-    "DOMAIN1": "yourdomain.com",
-    // optional second seed, imported the same way
-    // "DOMAIN2": "seconddomain.com"
-  },
+  // sending domains are managed in the dashboard at /domains
   "d1_databases": [
     {
       // the binding must be named DB; the database can be called anything
@@ -64,10 +60,8 @@ Wrangler picks up `wrangler.jsonc` automatically — no flag needed. If you
 ever have both a `wrangler.toml` and a `wrangler.jsonc` in the folder,
 delete one, or Wrangler will complain about the ambiguity.
 
-With a database bound, `DOMAIN1` (and `DOMAIN2`, if set) are imported into
-the `/domains` list exactly once, on first run — afterwards that page owns
-the list. Every domain on it must also be verified in Resend (Domains tab),
-or sends from it fail.
+Every domain you add must also be verified in Resend (its dashboard,
+Domains tab), or sends from it fail.
 
 ### Optional: access protection
 
@@ -92,11 +86,12 @@ browsers where cookies get wiped.
 | `/logout` | Clears the session cookie (the sidebar's "Log out" link). |
 | `/sent` | History, newest first; click a message to expand the full body. |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
-| `/domains` | The sending-domain list — add and remove (needs the DB binding). |
+| `/domains` | The sending-domain list — add, remove, set the default. |
 | `POST /send` | JSON API. Token in the `X-Auth-Token` header, or the session cookie. |
 | `POST /usage/sync` | Refresh delivery details for the 25 most recent sends. |
 | `POST /domains/add` | Add a sending domain: `{"domain":"example.com"}`. |
 | `POST /domains/remove` | Remove one — the last remaining domain is refused. |
+| `POST /domains/default` | Mark a domain as the default. |
 
 Pages take the token via `?token=`; the form and dashboard then pass it
 along in the `X-Auth-Token` header automatically, so links between pages
@@ -110,14 +105,11 @@ the cookie along.
 
 Open the Worker's URL, fill in the form, send. The "From address" field is
 the local part only — the domain comes from your list on the **Domains**
-page (the first entry is the default; with more than one, a picker appears
-next to the field), shown live in the hint under the field and in the
+page: the one you marked with *Set default*, or the oldest entry until you
+pick one. With more than one domain, a picker appears next to the field;
+the final address is shown live in the hint under the field and in the
 sidebar. Multiple recipients, comma-separated. Every attempt is logged,
 including failures with Resend's error message.
-
-Sending domains are managed at `/domains`: add and remove as many as you
-like, first on the list is the default. Each must also be verified in
-Resend — that part happens in Resend's dashboard, not here.
 
 For HTML email, check *Send as HTML* and paste your markup into the message
 box, then press **Preview** to see it rendered exactly as the recipient
@@ -152,19 +144,20 @@ automatically, with the raw source collapsed under a *Source* drop-down.
 **Sending.** Input is validated (recipients, subject, body, Reply-To) before
 anything leaves the Worker; the message must be `text` or `html`. The `from`
 address is built as `local@` plus the chosen domain — the picker on the
-form, `from_domain` in the API, the first list entry by default — with the
-local part sanitized and the domain checked against the stored list;
-Resend's response is passed through — a 401 means a bad key, a 403 usually
-means the domain isn't verified in Resend yet.
+form, `from_domain` in the API, the default otherwise — with the local part
+sanitized and the domain checked against the stored list; Resend's response
+is passed through — a 401 means a bad key, a 403 usually means the domain
+isn't verified in Resend yet.
 
-**Domains.** The sending-domain list is a D1 table, edited on the `/domains`
-page — add and remove, the first entry is the default. `DOMAIN1`/`DOMAIN2`
-are imported into it exactly once, on the first run with a database bound;
-afterwards the page is the source of truth: removing a domain there is
-final, and later edits to the variables change nothing. Removing the last
-domain is refused — compose needs one. Without a DB binding the variables
-are used directly and `/domains` says so. The list only gates what Outbox
+**Domains.** The sending-domain list is a D1 table, edited only at
+`/domains` — environment variables are never consulted. Add and remove as
+you like; the default is whichever domain you mark with *Set default*
+(the oldest entry until you pick one, and again if the default is removed).
+Removing the last domain is refused. The list only gates what Outbox
 offers; verifying a domain with Resend still happens in their dashboard.
+Without a DB binding, `/domains` says so, and with no domains configured
+the compose page links to `/domains` instead of a dead form — nothing
+dead-ends.
 
 **Access.** Optional, two ways: a `PASSWORD` secret gates every page behind
 a login screen (signed 30-day session cookie whose key is derived from the
@@ -248,8 +241,9 @@ replaces them with `null` before checking.
 
 ## Quick test checklist
 
-1. Compose page loads with the title "Outbox"; the hint under "From address"
-   reads `noreply@DOMAIN1` and updates as you type.
+1. Fresh deploy: the compose page points you to `/domains`; add a domain
+   there, and the hint under "From address" reads `noreply@<that domain>`
+   and updates as you type.
 2. Send a test email: green confirmation with a Resend ID.
 3. `/sent`: the message is there, newest first; click it — from, to,
    subject and full body render; delivery status appears after a usage sync.
@@ -278,11 +272,12 @@ replaces them with `null` before checking.
     originally requested; "Log out" (sidebar link) clears the session and
     the next visit redirects again. Change the password and reload — the
     old session is dead.
-11. `/domains`: the list starts with your `DOMAIN1` (plus `DOMAIN2` if
-    set). Add a domain — it appears in the compose picker and the sidebar
-    footer; remove it — it's gone for good. Try removing the last remaining
-    domain: refused. `POST /send` with a `from_domain` not on the list
-    returns a 400 naming the allowed domains.
+11. `/domains`: add a second domain — it appears in the compose picker and
+    the sidebar footer; press *Set default* on it — it becomes the picker's
+    preselection and the domain used when `from_domain` is omitted; remove
+    it — gone for good. Try removing the last remaining domain: refused.
+    `POST /send` with a `from_domain` not on the list returns a 400 naming
+    the allowed domains.
 
 ---
 
@@ -302,12 +297,10 @@ replaces them with `null` before checking.
   `wrangler dev`) some browsers won't store it.
 - Logging out is a plain GET link, so anything that gets your browser to
   follow a `/logout` link logs you out — an annoyance, not a leak.
-- The domain list imports `DOMAIN1`/`DOMAIN2` exactly once (first run with
-  a database bound). Later changes to those variables don't reach the list —
-  edit it at `/domains` instead.
-- Adding a domain at `/domains` only puts it on Outbox's list. Resend still
-  has to verify it (their dashboard, Domains tab) before sends from it
-  succeed — otherwise you get Resend's 403.
+- Domains can only be added at `/domains`, which needs the `DB` binding —
+  without a database, no domains can be configured and sending is disabled.
+  Adding a domain here only puts it on Outbox's list: Resend still has to
+  verify it (their dashboard), otherwise you get Resend's 403.
 - `/usage` shows the **100 most recent** sends Resend has on record; older
   history is not included (the page says so when it applies). Each page
   view costs one Resend API read, which counts against their rate limits.
