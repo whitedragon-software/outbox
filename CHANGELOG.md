@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+- CSV export of the send history: `GET /sent/export` (authed like the
+  pages, so it works as a plain link) plus an "Export CSV" link on
+  `/sent`. One row per attempt — successes and failures alike — with id,
+  date, status, delivery status, Resend ID, from, to, reply-to, subject,
+  content type, archived body and error. RFC 4180 quoting, UTF-8 with BOM
+  so Excel keeps non-ASCII subjects intact, CRLF line endings, filename
+  `outbox-export-YYYY-MM-DD.csv`. The export covers the entire archive,
+  not just the newest 200 shown on `/sent`.
+
 ## 0.7.2
 
 ### Added
