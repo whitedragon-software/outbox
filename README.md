@@ -2,12 +2,12 @@
 
 A single-file Cloudflare Worker that sends email through Resend from your own
 domains: a compose form with live HTML preview, a complete send history in D1
-with rendered previews, and a usage dashboard that reads live from Resend so
-the numbers always match the provider's. All four pages share one dashboard
-shell — sidebar navigation on desktop, a top bar on mobile — with a
-light/dark theme toggle, light by default. Optional password login; the
-sending-domain list lives in the database and is managed entirely from the
-dashboard.
+with rendered previews and one-click CSV export, and a usage dashboard that
+reads live from Resend so the numbers always match the provider's. All four
+pages share one dashboard shell — sidebar navigation on desktop, a top bar on
+mobile — with a light/dark theme toggle, light by default. Optional password
+login; the sending-domain list lives in the database and is managed entirely
+from the dashboard.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -85,6 +85,7 @@ browsers where cookies get wiped.
 | `/login` | Password login (only active when `PASSWORD` is set). |
 | `/logout` | Clears the session cookie (the sidebar's "Log out" link). |
 | `/sent` | History, newest first; click a message to expand the full body. |
+| `/sent/export` | CSV of the full send history (the "Export CSV" link on `/sent`). |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
 | `/domains` | The sending-domain list — add, remove, set the default. |
 | `POST /send` | JSON API. Token in the `X-Auth-Token` header, or the session cookie. |
@@ -136,6 +137,9 @@ records, so its counts agree with Resend's dashboard even for emails sent
 before the history feature existed — those get back-filled into `/sent` on
 the first visit. On `/sent`, HTML messages display as the rendered preview
 automatically, with the raw source collapsed under a *Source* drop-down.
+The **Export CSV** link on `/sent` downloads the whole archive — successes
+and failures both — as `outbox-export-<date>.csv`, Excel- and Sheets-safe
+(RFC 4180 quoting, UTF-8 BOM, CRLF).
 
 ---
 
@@ -176,7 +180,8 @@ the same first-use bootstrap creates the `domains` and `settings` tables.
 DB writes are wrapped so a logging failure never turns a delivered email
 into an error: the form shows a "could not save to history" warning
 instead. When both `text` and `html` are sent, the HTML part is what gets
-archived.
+archived. The whole table exports as CSV from `/sent/export`, authed like
+the pages so the `?token=` travels with the link.
 
 **Usage.** `/usage` calls Resend's list endpoint on every page load and
 computes all numbers from Resend's own records — the one exception is
@@ -278,6 +283,11 @@ replaces them with `null` before checking.
     it — gone for good. Try removing the last remaining domain: refused.
     `POST /send` with a `from_domain` not on the list returns a 400 naming
     the allowed domains.
+12. `/sent` → *Export CSV*: `outbox-export-<date>.csv` downloads; opening
+    it in a spreadsheet shows one row per logged attempt, non-ASCII
+    subjects survive intact, and failed rows carry Resend's error in the
+    last column. Send a couple more emails and export again — the row
+    count grows accordingly.
 
 ---
 
@@ -301,6 +311,10 @@ replaces them with `null` before checking.
   without a database, no domains can be configured and sending is disabled.
   Adding a domain here only puts it on Outbox's list: Resend still has to
   verify it (their dashboard), otherwise you get Resend's 403.
+- The CSV export is the D1 archive, not a copy of the original mail:
+  bodies are single-part (only the HTML part when both were sent), and the
+  file isn't re-importable as email. The whole table ships in one response,
+  so a very large history could hit D1's response-size cap.
 - `/usage` shows the **100 most recent** sends Resend has on record; older
   history is not included (the page says so when it applies). Each page
   view costs one Resend API read, which counts against their rate limits.
