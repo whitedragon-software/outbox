@@ -756,3 +756,39 @@ function renderUsagePage(stats, token) {
   <h2>Top recipients</h2>
   ${topRec}
   <p class="muted">Based on your most recent 500 messages.</p>
+
+  <div>
+    <a class="nav" href="/${tokenParam}">&larr; Compose</a>
+    <a class="nav" href="/sent${tokenParam}">Sent messages</a>
+  </div>
+</div>
+<script>
+(function () {
+  var TOKEN = ${tokenJson};
+  var btn = document.getElementById("sync-btn");
+  var msg = document.getElementById("sync-msg");
+  btn.addEventListener("click", function () {
+    btn.disabled = true;
+    btn.textContent = "Syncing...";
+    msg.textContent = "";
+    fetch("/usage/sync", { method: "POST", headers: { "X-Auth-Token": TOKEN } })
+      .then(function (res) { return res.json(); })
+      .then(function (d) {
+        if (d.success) {
+          msg.textContent = "Checked " + d.checked + " recent email" + (d.checked === 1 ? "" : "s") + ".";
+          setTimeout(function () { location.reload(); }, 900);
+        } else {
+          msg.textContent = "Error: " + (d.error || "Unknown error");
+        }
+      })
+      .catch(function (err) { msg.textContent = "Error: " + err.message; })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "Sync delivery status from Resend";
+      });
+  });
+})();
+</script>
+</body>
+</html>`;
+    }
