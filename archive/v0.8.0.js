@@ -24,6 +24,15 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;");
 }
 
+// RFC 4180: quote a CSV field only when it contains a comma, quote, CR or
+// LF; embedded quotes are doubled. null/undefined become empty fields.
+function csvField(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
 function redirect(location, status = 302) {
   return new Response(null, {
     status,
@@ -346,6 +355,52 @@ export default {
 
       return new Response(renderSentPage(rows, token, domains, showLogout), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+
+    // CSV export of the full send history
+    if (request.method === "GET" && url.pathname === "/sent/export") {
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
+      if (!env.DB) {
+        return new Response(
+          "No D1 database is bound as DB.",
+          { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+        );
+      }
+
+      await ensureSchema(env);
+
+      let rows = [];
+      try {
+        // The whole archive, not just the newest 200 shown on /sent.
+        const result = await env.DB.prepare("SELECT * FROM emails ORDER BY id DESC").all();
+        rows = result.results || [];
+      } catch (err) {
+        return new Response("Failed to read from D1: " + err.message, { status: 500 });
+      }
+
+      const header =
+        "id,date,status,delivery_status,resend_id,from,to,reply_to,subject,content_type,body,error";
+      const lines = rows.map(function (r) {
+        return [
+          r.id, r.created_at, r.status, r.delivery_status, r.resend_id,
+          r.from_address, r.to_addresses, r.reply_to, r.subject,
+          r.content_type, r.body, r.error,
+        ].map(csvField).join(",");
+      });
+
+      // UTF-8 BOM so Excel decodes non-ASCII subjects correctly; CRLF
+      // line endings per RFC 4180.
+      const csv = "\uFEFF" + [header].concat(lines).join("\r\n") + "\r\n";
+      const filename = "outbox-export-" + new Date().toISOString().slice(0, 10) + ".csv";
+
+      return new Response(csv, {
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="' + filename + '"',
+          "Cache-Control": "no-store",
+        },
       });
     }
 
@@ -1843,6 +1898,8 @@ function renderDomainsPage(domains, token, showLogout) {
 }
 
 function renderSentPage(rows, token, domains, showLogout) {
+  const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+
   const items = rows.length
     ? rows
         .map(function (r) {
@@ -1876,14 +1933,20 @@ function renderSentPage(rows, token, domains, showLogout) {
 
   const content = `
 <div class="page-head">
-  <h1>Sent messages</h1>
-  <p class="sub">Last ${rows.length} message${rows.length === 1 ? "" : "s"} (most recent first).</p>
+  <div class="head-row">
+    <div>
+      <h1>Sent messages</h1>
+      <p class="sub">Last ${rows.length} message${rows.length === 1 ? "" : "s"} (most recent first).</p>
+    </div>
+    <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
+  </div>
 </div>
 <div class="card">
  ${items}
 </div>`;
 
   const extraCss = `
+  .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
   .msg summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -2095,4 +2158,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-       }
+}
