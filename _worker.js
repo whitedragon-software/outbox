@@ -360,23 +360,78 @@ export default {
 
       await ensureSchema(env);
 
-      // History and the domain list are independent — read both at once.
+      // Search + filter. ?q= matches across the whole archive, ?status= is
+      // "sent" or "failed"; with neither present the query is exactly the
+      // old "newest 200". The pattern is always bound, never string-built,
+      // and % _ \ inside the search text are escaped so they stay literal
+      // (LIKE is case-insensitive for ASCII letters).
+      const q = String(url.searchParams.get("q") || "").trim();
+      const statusParam = String(url.searchParams.get("status") || "").trim();
+      const status =
+        statusParam === "sent" || statusParam === "failed" ? statusParam : "";
+      const filtered = q !== "" || status !== "";
+
+      let where = "";
+      const binds = [];
+      if (filtered) {
+        const clauses = [];
+        if (q !== "") {
+          const pattern =
+            "%" + q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_") + "%";
+          const likeCols = [
+            "subject", "body", "to_addresses", "cc_addresses", "bcc_addresses",
+            "from_address", "reply_to", "resend_id", "error",
+          ];
+          clauses.push(
+            "(" + likeCols.map(function (c) { return c + " LIKE ? ESCAPE '\\'"; }).join(" OR ") + ")"
+          );
+          likeCols.forEach(function () { binds.push(pattern); });
+        }
+        if (status !== "") {
+          clauses.push("status = ?");
+          binds.push(status);
+        }
+        where = " WHERE " + clauses.join(" AND ");
+      }
+
       let rows = [];
       let domains = [];
+      let totalMatches = null;
       try {
-        const [result, domainList] = await Promise.all([
-          env.DB.prepare("SELECT * FROM emails ORDER BY id DESC LIMIT 200").all(),
+        // History and the domain list are independent — read both at once
+        // (plus the match count when a filter is active).
+        const rowsSql = "SELECT * FROM emails" + where + " ORDER BY id DESC LIMIT 200";
+        const reads = [
+          binds.length
+            ? env.DB.prepare(rowsSql).bind(...binds).all()
+            : env.DB.prepare(rowsSql).all(),
           getDomains(env),
-        ]);
-        rows = result.results || [];
-        domains = domainList;
+        ];
+        if (filtered) {
+          const countSql = "SELECT COUNT(*) AS c FROM emails" + where;
+          reads.push(
+            binds.length
+              ? env.DB.prepare(countSql).bind(...binds).first()
+              : env.DB.prepare(countSql).first()
+          );
+        }
+        const settled = await Promise.all(reads);
+        rows = settled[0].results || [];
+        domains = settled[1];
+        totalMatches = filtered && settled[2] ? Number(settled[2].c || 0) : null;
       } catch (err) {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
 
-      return new Response(renderSentPage(rows, token, domains, showLogout), {
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
-      });
+      return new Response(
+        renderSentPage(rows, token, domains, showLogout, {
+          q: q,
+          status: status,
+          filtered: filtered,
+          totalMatches: totalMatches,
+        }),
+        { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+      );
     }
 
     // CSV export of the full send history
@@ -1943,8 +1998,35 @@ function renderDomainsPage(domains, token, showLogout) {
   });
 }
 
-function renderSentPage(rows, token, domains, showLogout) {
+function renderSentPage(rows, token, domains, showLogout, filter) {
   const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+  const f = filter || { q: "", status: "", filtered: false, totalMatches: null };
+
+  // Header line: the match count when searching/filtering, the old
+  // "Last N messages" line otherwise.
+  const sub = f.filtered && f.totalMatches !== null
+    ? '<p class="sub">' + f.totalMatches + " match" + (f.totalMatches === 1 ? "" : "es") +
+      " across the whole archive" +
+      (f.totalMatches > rows.length ? " — showing the newest " + rows.length + "." : ".") +
+      "</p>"
+    : '<p class="sub">Last ' + rows.length + " message" + (rows.length === 1 ? "" : "s") +
+      " (most recent first).</p>";
+
+  // Plain-HTML GET form — the sent page stays script-free. The token rides
+  // along in a hidden field so AUTH_TOKEN-only setups keep working.
+  const filterForm =
+    '<form class="filter" method="get" action="/sent">' +
+    (token ? '<input type="hidden" name="token" value="' + escapeHtml(token) + '">' : "") +
+    '<input type="search" name="q" value="' + escapeHtml(f.q) +
+    '" placeholder="Search subject, body, addresses, error…" aria-label="Search sent messages">' +
+    '<select name="status" aria-label="Filter by status">' +
+    '<option value=""' + (f.status === "" ? " selected" : "") + ">All statuses</option>" +
+    '<option value="sent"' + (f.status === "sent" ? " selected" : "") + ">Sent</option>" +
+    '<option value="failed"' + (f.status === "failed" ? " selected" : "") + ">Failed</option>" +
+    "</select>" +
+    '<button type="submit" class="btn small">Search</button>' +
+    (f.filtered ? '<a class="btn ghost small" href="/sent' + tokenParam + '">Clear</a>' : "") +
+    "</form>";
 
   const items = rows.length
     ? rows
@@ -1977,23 +2059,29 @@ function renderSentPage(rows, token, domains, showLogout) {
           );
         })
         .join("")
-    : '<p class="muted">No messages sent yet.</p>';
+    : '<p class="muted">' +
+      (f.filtered ? "No messages match this search." : "No messages sent yet.") +
+      "</p>";
 
   const content = `
 <div class="page-head">
   <div class="head-row">
     <div>
       <h1>Sent messages</h1>
-      <p class="sub">Last ${rows.length} message${rows.length === 1 ? "" : "s"} (most recent first).</p>
+      ${sub}
     </div>
     <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
   </div>
 </div>
 <div class="card">
+ ${filterForm}
  ${items}
 </div>`;
 
   const extraCss = `
+  .filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
+  .filter input[type="search"] { flex: 1 1 200px; width: auto; min-width: 0; }
+  .filter select { flex: 0 0 auto; width: auto; }
   .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
@@ -2206,4 +2294,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-      }
+    }
