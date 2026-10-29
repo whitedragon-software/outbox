@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.2
+
+### Added
+- Search and filter on `/sent`: a plain-HTML form at the top of the page
+  with a text box and a status select (All / Sent / Failed), submitted as
+  a plain GET so it carries the `?token=` along in a hidden field and
+  works with JavaScript disabled. The search covers the entire archive,
+  not just the newest 200 shown by default — subject, body, To, CC, BCC,
+  From, Reply-To, Resend ID and the error text are all matched,
+  case-insensitively. `%` and `_` in the box are matched literally (bound
+  parameters with `ESCAPE '\'`, so input can't change the query).
+  Matching still returns at most 200 rows, with a match count and a
+  Clear link above the list. **With no search text and no status picked,
+  `/sent` renders exactly as before: same query, same page.**
+
 ## 0.8.1
 
 ### Added
@@ -228,4 +243,3 @@
 - Optional `AUTH_TOKEN` protection: pages require `?token=…`, API calls
   the `X-Auth-Token` header. **Unset, everything behaves as before.**
 - Configuration: `RESEND_KEY` (secret), `DOMAIN1` (var).
-````
