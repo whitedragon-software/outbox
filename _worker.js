@@ -240,7 +240,6 @@ async function getDomains(env) {
   } catch {}
   return [];
 }
-
 // --- Routing ------------------------------------------------------------
 export default {
   async fetch(request, env) {
@@ -1173,7 +1172,6 @@ async function syncDeliveryStatuses(env) {
   }
   return { checked, byStatus };
 }
-
 // --- Pages: shared dashboard shell --------------------------------------
 // All pages render through renderShell(): sidebar navigation on desktop
 // that collapses into a sticky top bar with tab navigation below 860px,
@@ -2294,4 +2292,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-    }
+         }
