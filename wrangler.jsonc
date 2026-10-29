@@ -2,13 +2,4 @@
   "name": "outbox",
   "main": "_worker.js",
   "compatibility_date": "2024-09-01",
-  // sending domains are managed in the dashboard at /domains
-  "d1_databases": [
-    {
-      // the binding must be named DB; the database can be called anything
-      "binding": "DB",
-      "database_name": "email-db",
-      "database_id": "<your-database-id>"
-    }
-  ]
 }
