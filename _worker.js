@@ -33,6 +33,15 @@ function csvField(v) {
   return s;
 }
 
+// "a@b.com, c@d.com " -> ["a@b.com", "c@d.com"]; empty pieces dropped.
+// Used for To, Cc and Bcc alike — all three accept the same format.
+function splitAddresses(v) {
+  return String(v || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function redirect(location, status = 302) {
   return new Response(null, {
     status,
@@ -159,6 +168,8 @@ async function ensureSchema(env) {
       "resend_id TEXT, " +
       "from_address TEXT NOT NULL, " +
       "to_addresses TEXT NOT NULL, " +
+      "cc_addresses TEXT, " +
+      "bcc_addresses TEXT, " +
       "reply_to TEXT, " +
       "subject TEXT NOT NULL, " +
       "body TEXT NOT NULL, " +
@@ -180,6 +191,16 @@ async function ensureSchema(env) {
   }
   try {
     await env.DB.prepare("ALTER TABLE emails ADD COLUMN content_type TEXT").run();
+  } catch (e) {
+    if (!String(e.message || e).includes("duplicate column")) throw e;
+  }
+  try {
+    await env.DB.prepare("ALTER TABLE emails ADD COLUMN cc_addresses TEXT").run();
+  } catch (e) {
+    if (!String(e.message || e).includes("duplicate column")) throw e;
+  }
+  try {
+    await env.DB.prepare("ALTER TABLE emails ADD COLUMN bcc_addresses TEXT").run();
   } catch (e) {
     if (!String(e.message || e).includes("duplicate column")) throw e;
   }
@@ -381,11 +402,12 @@ export default {
       }
 
       const header =
-        "id,date,status,delivery_status,resend_id,from,to,reply_to,subject,content_type,body,error";
+        "id,date,status,delivery_status,resend_id,from,to,cc,bcc,reply_to,subject,content_type,body,error";
       const lines = rows.map(function (r) {
         return [
           r.id, r.created_at, r.status, r.delivery_status, r.resend_id,
-          r.from_address, r.to_addresses, r.reply_to, r.subject,
+          r.from_address, r.to_addresses, r.cc_addresses, r.bcc_addresses,
+          r.reply_to, r.subject,
           r.content_type, r.body, r.error,
         ].map(csvField).join(",");
       });
@@ -649,10 +671,9 @@ async function handleSend(request, env) {
     return json({ success: false, error: "Request body must be valid JSON." }, 400);
   }
 
-  const recipients = String(body.to || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const recipients = splitAddresses(body.to);
+  const cc = splitAddresses(body.cc);
+  const bcc = splitAddresses(body.bcc);
   const subject = String(body.subject || "").trim();
   const text = String(body.text || "").trim();
   const html = String(body.html || "").trim();
@@ -667,8 +688,19 @@ async function handleSend(request, env) {
   if (recipients.length === 0 || !recipients.every((e) => EMAIL_RE.test(e))) {
     return json({ success: false, error: "Please provide valid recipient email address(es)." }, 400);
   }
-  if (recipients.length > MAX_RECIPIENTS) {
-    return json({ success: false, error: "Too many recipients (max " + MAX_RECIPIENTS + ")." }, 400);
+  if (cc.length > 0 && !cc.every((e) => EMAIL_RE.test(e))) {
+    return json({ success: false, error: "Please provide valid Cc email address(es)." }, 400);
+  }
+  if (bcc.length > 0 && !bcc.every((e) => EMAIL_RE.test(e))) {
+    return json({ success: false, error: "Please provide valid Bcc email address(es)." }, 400);
+  }
+  // One shared cap across all three lists — Resend allows 50 recipients
+  // per message counting To, Cc and Bcc together.
+  if (recipients.length + cc.length + bcc.length > MAX_RECIPIENTS) {
+    return json(
+      { success: false, error: "Too many recipients (max " + MAX_RECIPIENTS + " across To, Cc and Bcc)." },
+      400
+    );
   }
   if (!subject) return json({ success: false, error: "Subject is required." }, 400);
   if (!text && !html) {
@@ -703,6 +735,8 @@ async function handleSend(request, env) {
   if (text) payload.text = text;
   if (html) payload.html = html;
   if (replyTo) payload.reply_to = replyTo;
+  if (cc.length) payload.cc = cc;
+  if (bcc.length) payload.bcc = bcc;
 
   await ensureSchema(env);
 
@@ -721,7 +755,7 @@ async function handleSend(request, env) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    await logEmail(env, null, from, recipients, replyTo, subject,
+    await logEmail(env, null, from, recipients, cc, bcc, replyTo, subject,
       storedBody, contentType, "failed", "Could not reach Resend: " + err.message);
     return json({ success: false, error: "Could not reach Resend: " + err.message }, 502);
   }
@@ -729,29 +763,31 @@ async function handleSend(request, env) {
   const data = await res.json().catch(() => ({}));
 
   if (res.ok) {
-    const saved = await logEmail(env, data.id || null, from, recipients, replyTo,
+    const saved = await logEmail(env, data.id || null, from, recipients, cc, bcc, replyTo,
       subject, storedBody, contentType, "sent", null);
     return json({ success: true, id: data.id || null, saved: saved });
   }
 
   const errMsg = data.message || "Resend returned HTTP " + res.status + ".";
-  await logEmail(env, null, from, recipients, replyTo, subject,
+  await logEmail(env, null, from, recipients, cc, bcc, replyTo, subject,
     storedBody, contentType, "failed", errMsg);
   return json({ success: false, error: errMsg }, 502);
 }
 
 // Writes the message into D1. Returns false (without throwing) if the
 // database is unavailable, so a logging problem never breaks the send.
-async function logEmail(env, resendId, from, recipients, replyTo, subject, body, contentType, status, error) {
+async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subject, body, contentType, status, error) {
   if (!env.DB) return false;
   await ensureSchema(env);
   try {
     await env.DB.prepare(
-      "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, content_type, status, error) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO emails (resend_id, from_address, to_addresses, cc_addresses, bcc_addresses, reply_to, subject, body, content_type, status, error) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind(resendId, from, recipients.join(", "), replyTo || null, subject, body,
-        contentType, status, error)
+      .bind(resendId, from, recipients.join(", "),
+        cc && cc.length ? cc.join(", ") : null,
+        bcc && bcc.length ? bcc.join(", ") : null,
+        replyTo || null, subject, body, contentType, status, error)
       .run();
     return true;
   } catch {
@@ -886,6 +922,8 @@ async function reconcileFromResend(env, list) {
       }
 
       const tos = Array.isArray(e.to) ? e.to : e.to ? [String(e.to)] : [];
+      const ccs = Array.isArray(e.cc) ? e.cc : e.cc ? [String(e.cc)] : [];
+      const bccs = Array.isArray(e.bcc) ? e.bcc : e.bcc ? [String(e.bcc)] : [];
       const replyTo = Array.isArray(e.reply_to)
         ? e.reply_to.join(", ")
         : e.reply_to
@@ -899,13 +937,15 @@ async function reconcileFromResend(env, list) {
       const contentType = e.text ? "text" : e.html ? "html" : null;
 
       await env.DB.prepare(
-        "INSERT INTO emails (resend_id, from_address, to_addresses, reply_to, subject, body, content_type, status, error, created_at, delivery_status) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'sent', NULL, ?, ?)"
+        "INSERT INTO emails (resend_id, from_address, to_addresses, cc_addresses, bcc_addresses, reply_to, subject, body, content_type, status, error, created_at, delivery_status) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', NULL, ?, ?)"
       )
         .bind(
           e.id,
           String(e.from || "unknown"),
           tos.join(", "),
+          ccs.length ? ccs.join(", ") : null,
+          bccs.length ? bccs.join(", ") : null,
           replyTo,
           String(e.subject || "(no subject)"),
           storedBody,
@@ -1575,6 +1615,10 @@ function renderPage(domains, token, showLogout) {
   <form id="send-form">
     <label for="to">To</label>
     <input id="to" type="text" placeholder="name@example.com (comma-separate for multiple)" required>
+    <label for="cc">Cc</label>
+    <input id="cc" type="text" placeholder="Optional, comma-separate for multiple">
+    <label for="bcc">Bcc</label>
+    <input id="bcc" type="text" placeholder="Optional, comma-separate for multiple">
     <label for="from_name">From name</label>
     <input id="from_name" type="text" placeholder="Optional, e.g. My App">
     <label for="from_local">From address</label>
@@ -1698,6 +1742,8 @@ function renderPage(domains, token, showLogout) {
 
     var payload = {
       to: document.getElementById("to").value,
+      cc: document.getElementById("cc").value,
+      bcc: document.getElementById("bcc").value,
       from_name: document.getElementById("from_name").value,
       from_local: localInput.value,
       reply_to: document.getElementById("reply_to").value,
@@ -1916,6 +1962,8 @@ function renderSentPage(rows, token, domains, showLogout) {
             "</summary>" +
             '<div class="msg-body">' +
             "<p><strong>From:</strong> " + escapeHtml(r.from_address || "") + "</p>" +
+            (r.cc_addresses ? "<p><strong>Cc:</strong> " + escapeHtml(r.cc_addresses) + "</p>" : "") +
+            (r.bcc_addresses ? "<p><strong>Bcc:</strong> " + escapeHtml(r.bcc_addresses) + "</p>" : "") +
             (r.reply_to ? "<p><strong>Reply-To:</strong> " + escapeHtml(r.reply_to) + "</p>" : "") +
             (r.resend_id ? "<p><strong>Resend ID:</strong> " + escapeHtml(r.resend_id) + "</p>" : "") +
             (r.delivery_status ? "<p><strong>Delivery:</strong> " + escapeHtml(r.delivery_status) + "</p>" : "") +
@@ -2158,4 +2206,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-}
+      }
