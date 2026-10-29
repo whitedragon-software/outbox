@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.1
+
+### Added
+- CC and BCC support: `POST /send` accepts two new optional fields, `cc`
+  and `bcc`. Both work exactly like `to` — comma-separated, trimmed,
+  validated against the same rules — and reach Resend as arrays; omit
+  them and they never appear in the payload at all. The compose form
+  grows two optional inputs under the To field, and empty inputs send
+  nothing. The 50-recipient cap counts to + cc + bcc combined, so the
+  new fields can't be used to bypass a limit that was always meant to
+  apply per message.
+- CC and BCC are archived and shown back: the `emails` table gains
+  `cc_addresses` and `bcc_addresses` columns via the same idempotent
+  migration as `delivery_status` and `content_type`, so existing
+  databases upgrade in place and keep their data. Both appear on
+  `/sent` when present, and the CSV export gains `cc` and `bcc` as the
+  final two columns — every existing column keeps its position, so
+  anything that already parses the export keeps working.
+  **Calls that don't use the new fields behave exactly as in 0.8.0:
+  same payload, same stored row. Nothing was renamed or removed.**
+
 ## 0.8.0
 
 ### Added
@@ -207,3 +228,4 @@
 - Optional `AUTH_TOKEN` protection: pages require `?token=…`, API calls
   the `X-Auth-Token` header. **Unset, everything behaves as before.**
 - Configuration: `RESEND_KEY` (secret), `DOMAIN1` (var).
+````
