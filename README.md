@@ -1,13 +1,13 @@
 # Outbox
 
 A single-file Cloudflare Worker that sends email through Resend from your own
-domains: a compose form with live HTML preview, a complete send history in D1
-with rendered previews and one-click CSV export, and a usage dashboard that
-reads live from Resend so the numbers always match the provider's. All four
-pages share one dashboard shell — sidebar navigation on desktop, a top bar on
-mobile — with a light/dark theme toggle, light by default. Optional password
-login; the sending-domain list lives in the database and is managed entirely
-from the dashboard.
+domains: a compose form (To, CC and BCC) with live HTML preview, a complete
+send history in D1 with rendered previews and one-click CSV export, and a
+usage dashboard that reads live from Resend so the numbers always match the
+provider's. All four pages share one dashboard shell — sidebar navigation on
+desktop, a top bar on mobile — with a light/dark theme toggle, light by
+default. Optional password login; the sending-domain list lives in the
+database and is managed entirely from the dashboard.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -25,11 +25,15 @@ https://outbox.<username>.workers.dev/
 ## Deploy
 
 Paste `_worker.js` into the Worker editor in the Cloudflare dashboard:
-create a Worker, replace the boilerplate with the file's contents, then add
-under Settings the `RESEND_KEY` secret and a D1 binding named `DB` — and,
+create a Worker, replace the boilerplate with the file's contents, then
+create the database in the dashboard — Storage & Databases → D1 SQL
+Database → Create, the name is up to you — and connect it there: open the
+Worker's Settings → Bindings, add a D1 binding named `DB`, and point it at
+that database. The binding name must be `DB`; the database itself can be
+called anything. Under the same Settings, add the `RESEND_KEY` secret and,
 optionally, a `PASSWORD` secret (login screen). Deploy, open the Worker's
-URL, go to **Domains**, and add your first sending domain. Done — no config
-file, no CLI. The free tier is enough.
+URL, go to **Domains**, and add your first sending domain. Done — no
+config file, no CLI. The free tier is enough.
 
 Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 
@@ -37,18 +41,14 @@ Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
 {
   "name": "outbox",
   "main": "_worker.js",
-  "compatibility_date": "2024-09-01",
-  // sending domains are managed in the dashboard at /domains
-  "d1_databases": [
-    {
-      // the binding must be named DB; the database can be called anything
-      "binding": "DB",
-      "database_name": "email-db",
-      "database_id": "<your-database-id>"
-    }
-  ]
+  "compatibility_date": "2026-10-01",
 }
 ```
+
+The config carries no bindings on purpose: the database is created and
+connected in the dashboard either way (see above), and bindings configured
+there are kept on `wrangler deploy` — so the file stays this small and one
+setup serves both routes.
 
 ```
 npx wrangler secret put RESEND_KEY
@@ -109,8 +109,10 @@ the local part only — the domain comes from your list on the **Domains**
 page: the one you marked with *Set default*, or the oldest entry until you
 pick one. With more than one domain, a picker appears next to the field;
 the final address is shown live in the hint under the field and in the
-sidebar. Multiple recipients, comma-separated. Every attempt is logged,
-including failures with Resend's error message.
+sidebar. Multiple recipients, comma-separated; optional CC and BCC fields
+sit right under it in the same comma-separated form, and empty means they
+are simply not sent. Every attempt is logged, including failures with
+Resend's error message.
 
 For HTML email, check *Send as HTML* and paste your markup into the message
 box, then press **Preview** to see it rendered exactly as the recipient
@@ -130,7 +132,10 @@ curl -X POST https://outbox.<username>.workers.dev/send \
 ```
 
 An optional `from_domain` field selects the sending domain; anything not
-on your list is rejected with a 400 naming the allowed domains.
+on your list is rejected with a 400 naming the allowed domains. Optional
+`cc` and `bcc` fields behave exactly like `to` — comma-separated, the same
+validation — and are omitted from the payload entirely when empty. The
+50-recipient cap counts To, CC and BCC together.
 
 The `/usage` dashboard pulls the most recent sends straight from Resend's own
 records, so its counts agree with Resend's dashboard even for emails sent
@@ -145,8 +150,9 @@ and failures both — as `outbox-export-<date>.csv`, Excel- and Sheets-safe
 
 ## How it works
 
-**Sending.** Input is validated (recipients, subject, body, Reply-To) before
-anything leaves the Worker; the message must be `text` or `html`. The `from`
+**Sending.** Input is validated (recipients — To, CC and BCC under the same
+rules and the same combined cap — subject, body, Reply-To) before anything
+leaves the Worker; the message must be `text` or `html`. The `from`
 address is built as `local@` plus the chosen domain — the picker on the
 form, `from_domain` in the API, the default otherwise — with the local part
 sanitized and the domain checked against the stored list; Resend's response
@@ -174,14 +180,15 @@ constant-time, and a failed login pauses half a second.
 **History.** Every send attempt — success *and* failure — is written to D1
 in the same request. The `emails` table is created automatically on first
 use (`CREATE TABLE IF NOT EXISTS`, so it never touches existing data), the
-`delivery_status` and `content_type` columns are added by `ALTER TABLE`
-migrations whose "duplicate column" errors are expected and swallowed, and
-the same first-use bootstrap creates the `domains` and `settings` tables.
-DB writes are wrapped so a logging failure never turns a delivered email
-into an error: the form shows a "could not save to history" warning
-instead. When both `text` and `html` are sent, the HTML part is what gets
-archived. The whole table exports as CSV from `/sent/export`, authed like
-the pages so the `?token=` travels with the link.
+`delivery_status`, `content_type`, `cc_addresses` and `bcc_addresses`
+columns are added by `ALTER TABLE` migrations whose "duplicate column"
+errors are expected and swallowed, and the same first-use bootstrap creates
+the `domains` and `settings` tables. DB writes are wrapped so a logging
+failure never turns a delivered email into an error: the form shows a
+"could not save to history" warning instead. When both `text` and `html`
+are sent, the HTML part is what gets archived. The whole table exports as
+CSV from `/sent/export`, authed like the pages so the `?token=` travels
+with the link.
 
 **Usage.** `/usage` calls Resend's list endpoint on every page load and
 computes all numbers from Resend's own records — the one exception is
@@ -285,9 +292,12 @@ replaces them with `null` before checking.
     the allowed domains.
 12. `/sent` → *Export CSV*: `outbox-export-<date>.csv` downloads; opening
     it in a spreadsheet shows one row per logged attempt, non-ASCII
-    subjects survive intact, and failed rows carry Resend's error in the
-    last column. Send a couple more emails and export again — the row
-    count grows accordingly.
+    subjects survive intact, failed rows carry Resend's error, and the CC
+    and BCC columns close each row. Send a couple more emails and export
+    again — the row count grows accordingly.
+13. Fill in CC and BCC on the compose form and send: both addresses get
+    their copy, `/sent` shows them, and leaving both fields empty behaves
+    exactly as before.
 
 ---
 
@@ -325,7 +335,7 @@ replaces them with `null` before checking.
   hand, and nothing sanitizes what you send (it's your own content going
   to your own recipients). `Reply-To` is a single address.
 - When both `text` and `html` are sent, only the HTML part is archived.
-- At most 50 recipients per send.
+- At most 50 recipients per send — To, CC and BCC counted together.
 - Resend's free plan allows 100 emails/day; the "Last 24 hours" card on
   `/usage` is the number to watch. D1 free-tier row limits are far above
   personal-mail volume.
@@ -338,3 +348,4 @@ replaces them with `null` before checking.
   between devices, and with JavaScript disabled the pages stay light. The
   system color-scheme preference is never auto-detected, so a dark-mode OS
   still gets the light theme until you toggle.
+````
