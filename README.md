@@ -2,12 +2,12 @@
 
 A single-file Cloudflare Worker that sends email through Resend from your own
 domains: a compose form (To, CC and BCC) with live HTML preview, a complete
-send history in D1 with rendered previews and one-click CSV export, and a
-usage dashboard that reads live from Resend so the numbers always match the
-provider's. All four pages share one dashboard shell — sidebar navigation on
-desktop, a top bar on mobile — with a light/dark theme toggle, light by
-default. Optional password login; the sending-domain list lives in the
-database and is managed entirely from the dashboard.
+send history in D1 with rendered previews, whole-archive search and one-click
+CSV export, and a usage dashboard that reads live from Resend so the numbers
+always match the provider's. All four pages share one dashboard shell —
+sidebar navigation on desktop, a top bar on mobile — with a light/dark theme
+toggle, light by default. Optional password login; the sending-domain list
+lives in the database and is managed entirely from the dashboard.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -16,8 +16,8 @@ https://outbox.<username>.workers.dev/
 - `_worker.js`: the Worker. Deploy this file as-is; no build step, no
   dependencies, no schema to run — it creates its own database tables on
   first use.
-- `wrangler.jsonc`: config for CLI deploys only. The dashboard route needs
-  none of it.
+- `wrangler.jsonc`: config for CLI deploys only, including the D1 binding.
+  The dashboard route needs none of it.
 - `CHANGELOG.md`: what changed in each build.
 
 ---
@@ -42,13 +42,24 @@ Or deploy from the command line with a `wrangler.jsonc` (comments allowed):
   "name": "outbox",
   "main": "_worker.js",
   "compatibility_date": "2026-10-01",
+  "d1_databases": [
+    {
+      "binding": "DB",               // the Worker reads this name — keep it
+      "database_name": "outbox",     // the database's name as it was created
+      "database_id": "00000000-0000-0000-0000-000000000000"  // replace with yours: npx wrangler d1 list
+    }
+  ]
 }
 ```
 
-The config carries no bindings on purpose: the database is created and
-connected in the dashboard either way (see above), and bindings configured
-there are kept on `wrangler deploy` — so the file stays this small and one
-setup serves both routes.
+The config carries the D1 binding now, so a CLI deploy is self-contained —
+no trip through the dashboard's binding settings. Create the database first
+(`npx wrangler d1 create outbox`, or reuse one that exists) and put its UUID
+into `database_id`; `npx wrangler d1 list` shows the IDs, and
+`database_name` must match the database's actual name. `binding` stays `DB` —
+the name the Worker reads. If you set the Worker up in the dashboard and
+later switch to `wrangler deploy`, fill in that database's ID first: the
+config's binding is what a deploy applies.
 
 ```
 npx wrangler secret put RESEND_KEY
@@ -84,7 +95,7 @@ browsers where cookies get wiped.
 | `/` | Compose form. Open as `/?token=…` when a token is set. |
 | `/login` | Password login (only active when `PASSWORD` is set). |
 | `/logout` | Clears the session cookie (the sidebar's "Log out" link). |
-| `/sent` | History, newest first; click a message to expand the full body. |
+| `/sent` | History, newest first, with search and an All / Sent / Failed filter; click a message to expand the full body. |
 | `/sent/export` | CSV of the full send history (the "Export CSV" link on `/sent`). |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
 | `/domains` | The sending-domain list — add, remove, set the default. |
@@ -146,6 +157,16 @@ The **Export CSV** link on `/sent` downloads the whole archive — successes
 and failures both — as `outbox-export-<date>.csv`, Excel- and Sheets-safe
 (RFC 4180 quoting, UTF-8 BOM, CRLF).
 
+Search on `/sent` covers the entire archive — not just the newest 200 shown
+by default. The box matches case-insensitively against subject, body, To,
+CC, BCC, From, Reply-To, Resend ID and the error text, with `%` and `_`
+treated as literal characters (no wildcard syntax to learn); the status
+select narrows the results to Sent or Failed. A search returns at most 200
+rows, with a match count and a *Clear* link above the list. The form is a
+plain GET — it works with JavaScript disabled and carries the `?token=`
+along in a hidden field — and **Export CSV** always exports everything,
+search or not.
+
 ---
 
 ## How it works
@@ -197,7 +218,7 @@ Resend's list. The Worker then reconciles D1 against Resend's list,
 importing sends it never logged and refreshing delivery statuses;
 reconciliation is best-effort and never blocks the page. If Resend is
 unreachable, the page falls back to D1 stats with a red warning naming the
-data source. The response shape is handled defensively (`{"data": [...]}`
+data source. The response shape is handled defensively (`{"data": [...]}` 
 or a bare array); if Resend changes it, `/usage` degrades to the fallback
 rather than breaking.
 
@@ -298,6 +319,12 @@ replaces them with `null` before checking.
 13. Fill in CC and BCC on the compose form and send: both addresses get
     their copy, `/sent` shows them, and leaving both fields empty behaves
     exactly as before.
+14. On `/sent`, type a fragment of an old subject into the search box: it
+    turns up even when it falls outside the newest 200 the page shows by
+    default, with the match count above the list. Switch the status select
+    to *Failed* — only failures match — and a `%` or `_` in the box matches
+    literally, not as a wildcard. *Clear* brings back the plain newest-200
+    view, and the page looks exactly as it did before searching.
 
 ---
 
@@ -349,3 +376,5 @@ replaces them with `null` before checking.
   system color-scheme preference is never auto-detected, so a dark-mode OS
   still gets the light theme until you toggle.
 ````
+
+One practical note: before your next `wrangler deploy`, replace the zero UUID with your real `database_id` — `npx wrangler d1 list` prints it, or copy it from the database's page in the dashboard. With the binding now declared in the config, a deploy applies that binding directly, so make sure it points at the database your history already lives in.
