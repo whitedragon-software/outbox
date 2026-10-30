@@ -375,6 +375,3 @@ replaces them with `null` before checking.
   between devices, and with JavaScript disabled the pages stay light. The
   system color-scheme preference is never auto-detected, so a dark-mode OS
   still gets the light theme until you toggle.
-````
-
-One practical note: before your next `wrangler deploy`, replace the zero UUID with your real `database_id` — `npx wrangler d1 list` prints it, or copy it from the database's page in the dashboard. With the binding now declared in the config, a deploy applies that binding directly, so make sure it points at the database your history already lives in.
