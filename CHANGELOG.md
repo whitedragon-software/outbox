@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.2
+## 0.10.0
 
 ### Added
 - Search and filter on `/sent`: a plain-HTML form at the top of the page
@@ -15,7 +15,7 @@
   Clear link above the list. **With no search text and no status picked,
   `/sent` renders exactly as before: same query, same page.**
 
-## 0.8.1
+## 0.9.0
 
 ### Added
 - CC and BCC support: `POST /send` accepts two new optional fields, `cc`
