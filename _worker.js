@@ -9,6 +9,15 @@ const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
 const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_S * 1000;
 const LOGIN_FAIL_DELAY_MS = 500;
 
+// CSV import: the 14 columns /sent/export writes are the only header
+// /sent/import accepts, and uploads are capped before they are read.
+const IMPORT_COLUMNS = [
+  "id", "date", "status", "delivery_status", "resend_id", "from", "to",
+  "cc", "bcc", "reply_to", "subject", "content_type", "body", "error",
+];
+const IMPORT_MAX_MB = 25;
+const IMPORT_MAX_BYTES = IMPORT_MAX_MB * 1024 * 1024;
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -31,6 +40,40 @@ function csvField(v) {
   const s = String(v);
   if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
+}
+
+// The other half of csvField: parses a CSV string into rows of fields.
+// Quoted fields may contain commas, doubled quotes and line breaks; both
+// CRLF and LF end a record; a UTF-8 BOM, if present, is stripped.
+function parseCsv(text) {
+  const s = String(text || "").replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && s[i + 1] === "\n") i++;
+      row.push(field); field = "";
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
 }
 
 // "a@b.com, c@d.com " -> ["a@b.com", "c@d.com"]; empty pieces dropped.
@@ -480,6 +523,13 @@ export default {
       });
     }
 
+    // Import sent emails from a CSV in the exact format /sent/export
+    // writes. A plain HTML form POST (multipart): the token rides in the
+    // action URL, since a file upload cannot set the X-Auth-Token header.
+    if (request.method === "POST" && url.pathname === "/sent/import") {
+      return handleImport(request, env, url, showLogout);
+    }
+
     // Usage dashboard — reads live from Resend (with D1 as fallback)
     if (request.method === "GET" && url.pathname === "/usage") {
       const denied = await requirePage(request, env, url);
@@ -849,6 +899,260 @@ async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subje
   }
 }
 
+// --- CSV import (POST /sent/import) --------------------------------------
+// Accepts a file in the exact format /sent/export writes and stores only
+// rows that are not already present: same id, same Resend ID, or — for
+// rows without a Resend ID — same full content. Identical rows inside the
+// file itself collapse to the first copy. Rows are skipped, never updated;
+// nothing is re-sent and Resend is never called.
+async function handleImport(request, env, url, showLogout) {
+  // POST auth like the other endpoints, plus the ?token= from the form's
+  // action URL — a multipart upload cannot set the X-Auth-Token header.
+  const token = url.searchParams.get("token") || "";
+  const authed =
+    (await isAuthorized(request, env)) ||
+    (!!env.AUTH_TOKEN &&
+      (await constantTimeEqual(token, env.AUTH_TOKEN)));
+  if (!authed) {
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+  if (!env.DB) {
+    return new Response("No D1 database is bound as DB.", {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  await ensureSchema(env);
+
+  const renderResult = async function (r, status) {
+    return new Response(
+      renderImportResult(r, token, await getDomains(env), showLogout),
+      {
+        status: status || 200,
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      }
+    );
+  };
+  const refuse = function (message, status) {
+    return renderResult({ error: message }, status);
+  };
+
+  // Cheap size gate on the declared upload size, before the body is read.
+  const declared = parseInt(request.headers.get("content-length") || "0", 10);
+  if (declared > IMPORT_MAX_BYTES + 4096) {
+    return refuse("That upload is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
+  }
+
+  let form = null;
+  try {
+    form = await request.formData();
+  } catch {}
+  const file = form ? form.get("csv") : null;
+  if (!file || typeof file === "string") {
+    return refuse("No file was uploaded — choose a CSV exported from the Sent page.", 400);
+  }
+  if (file.size > IMPORT_MAX_BYTES) {
+    return refuse("That file is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
+  }
+
+  const table = parseCsv(await file.text());
+  const records = table.filter(function (r) {
+    return r.length > 1 || (r.length === 1 && r[0].trim() !== "");
+  });
+  if (records.length < 2) {
+    return refuse("That file has no data rows — nothing was imported.", 400);
+  }
+
+  // The header must name the same 14 columns the export writes, in any
+  // order; anything else is refused before a single row is written.
+  const header = records[0].map(function (h) { return h.trim().toLowerCase(); });
+  const missing = IMPORT_COLUMNS.filter(function (name) { return header.indexOf(name) === -1; });
+  if (missing.length > 0) {
+    return refuse(
+      "The header row does not match the export format — missing column(s): " +
+        missing.join(", ") + ".",
+      400
+    );
+  }
+  const col = {};
+  IMPORT_COLUMNS.forEach(function (name) { col[name] = header.indexOf(name); });
+
+  // Row-by-row validation: status is the one hard rule. Everything else is
+  // stored as it arrives.
+  const candidates = [];
+  const invalid = [];
+  for (let i = 1; i < records.length; i++) {
+    const rec = records[i];
+    const cell = function (name) {
+      const v = rec[col[name]];
+      return v === undefined ? "" : String(v);
+    };
+    if (rec.length < header.length) {
+      invalid.push("record " + (i + 1) + ": fewer fields than the header");
+      continue;
+    }
+    const status = cell("status").trim().toLowerCase();
+    if (status !== "sent" && status !== "failed") {
+      invalid.push("record " + (i + 1) + ": status must be sent or failed");
+      continue;
+    }
+    const idRaw = cell("id").trim();
+    candidates.push({
+      id: /^[0-9]+$/.test(idRaw) ? parseInt(idRaw, 10) : null,
+      resend_id: cell("resend_id").trim(),
+      from_address: cell("from"),
+      to_addresses: cell("to"),
+      cc_addresses: cell("cc"),
+      bcc_addresses: cell("bcc"),
+      reply_to: cell("reply_to"),
+      subject: cell("subject"),
+      body: cell("body"),
+      content_type: cell("content_type").trim().toLowerCase(),
+      status: status,
+      error: cell("error"),
+      delivery_status: cell("delivery_status").trim().toLowerCase(),
+      created_at: cell("date").trim(),
+    });
+  }
+
+  // Duplicate check, pass 1 — bulk and cheap, chunked like reconciliation:
+  // which ids and which Resend IDs already exist in the archive?
+  const existingIds = new Set();
+  const existingRids = new Set();
+  try {
+    const idVals = [];
+    const ridVals = [];
+    for (const c of candidates) {
+      if (c.id !== null && idVals.indexOf(c.id) === -1) idVals.push(c.id);
+      if (c.resend_id !== "" && ridVals.indexOf(c.resend_id) === -1) ridVals.push(c.resend_id);
+    }
+    for (let i = 0; i < idVals.length; i += 50) {
+      const chunk = idVals.slice(i, i + 50);
+      const r = await env.DB.prepare(
+        "SELECT id FROM emails WHERE id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+      ).bind(...chunk).all();
+      for (const row of r.results || []) existingIds.add(row.id);
+    }
+    for (let i = 0; i < ridVals.length; i += 50) {
+      const chunk = ridVals.slice(i, i + 50);
+      const r = await env.DB.prepare(
+        "SELECT resend_id FROM emails WHERE resend_id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+      ).bind(...chunk).all();
+      for (const row of r.results || []) existingRids.add(row.resend_id);
+    }
+  } catch (err) {
+    return refuse("Could not read from D1: " + err.message, 500);
+  }
+
+  // Pass 2 — decide. A row is stored only when nothing identical exists:
+  // not its id, not its Resend ID, and (when it has no Resend ID) not its
+  // full content. The seen-sets carry the same rule across the rows of
+  // this file, so a repeat inside the file collapses to the first copy.
+  const seenIds = new Set();
+  const seenRids = new Set();
+  const seenContent = new Set();
+  const toInsert = [];
+  let skipped = 0;
+  for (const c of candidates) {
+    if (c.id !== null && (existingIds.has(c.id) || seenIds.has(c.id))) { skipped++; continue; }
+    if (c.resend_id !== "" && (existingRids.has(c.resend_id) || seenRids.has(c.resend_id))) {
+      skipped++; continue;
+    }
+    const key = importTupleKey(c);
+    if (seenContent.has(key)) { skipped++; continue; }
+    if (c.resend_id === "") {
+      // No Resend ID to lean on — compare every archived field against the
+      // archive. SQLite evaluates the cheap columns first, so bodies are
+      // only read for rows that already match on everything else.
+      try {
+        const dup = await env.DB.prepare(
+          "SELECT id FROM emails WHERE " +
+            "IFNULL(created_at,'') = ? AND status = ? AND IFNULL(delivery_status,'') = ? " +
+            "AND IFNULL(from_address,'') = ? AND IFNULL(to_addresses,'') = ? " +
+            "AND IFNULL(cc_addresses,'') = ? AND IFNULL(bcc_addresses,'') = ? " +
+            "AND IFNULL(reply_to,'') = ? AND subject = ? AND IFNULL(content_type,'') = ? " +
+            "AND IFNULL(body,'') = ? AND IFNULL(error,'') = ? LIMIT 1"
+        )
+          .bind(
+            c.created_at, c.status, c.delivery_status,
+            c.from_address, c.to_addresses, c.cc_addresses,
+            c.bcc_addresses, c.reply_to, c.subject,
+            c.content_type, c.body, c.error
+          )
+          .first();
+        if (dup) { skipped++; seenContent.add(key); continue; }
+      } catch (err) {
+        return refuse("Could not read from D1: " + err.message, 500);
+      }
+    }
+    seenContent.add(key);
+    if (c.resend_id !== "") seenRids.add(c.resend_id);
+    if (c.id !== null) seenIds.add(c.id);
+    toInsert.push(c);
+  }
+
+  // Pass 3 — store, in batches of 50. On a failure the rows already
+  // committed stay; the report says exactly how far it got, and a re-run
+  // skips everything that made it in.
+  let stored = 0;
+  try {
+    for (let i = 0; i < toInsert.length; i += 50) {
+      const batch = [];
+      for (const c of toInsert.slice(i, i + 50)) {
+        const cols = [];
+        const vals = [];
+        if (c.id !== null) { cols.push("id"); vals.push(c.id); }
+        cols.push("resend_id", "from_address", "to_addresses", "cc_addresses",
+          "bcc_addresses", "reply_to", "subject", "body", "content_type",
+          "status", "error", "delivery_status");
+        vals.push(
+          c.resend_id || null, c.from_address, c.to_addresses,
+          c.cc_addresses || null, c.bcc_addresses || null, c.reply_to || null,
+          c.subject, c.body, c.content_type || null, c.status,
+          c.error || null, c.delivery_status || null
+        );
+        if (c.created_at) { cols.push("created_at"); vals.push(c.created_at); }
+        batch.push(
+          env.DB.prepare(
+            "INSERT INTO emails (" + cols.join(", ") + ") VALUES (" +
+            cols.map(function () { return "?"; }).join(", ") + ")"
+          ).bind(...vals)
+        );
+      }
+      await env.DB.batch(batch);
+      stored += batch.length;
+    }
+  } catch (err) {
+    return renderResult({
+      error:
+        "The import stopped partway: " + err.message + " — " + stored + " of " +
+        toInsert.length + " rows were written (only the non-duplicates). Fix the file and import it again; what is already in the archive is skipped automatically.",
+    }, 500);
+  }
+
+  return renderResult({
+    imported: stored,
+    skipped: skipped,
+    invalid: invalid,
+  });
+}
+
+// Content fingerprint for the import's duplicate check: every archived
+// field except the row id. Two records count as the same email when all
+// of these match.
+function importTupleKey(c) {
+  return JSON.stringify([
+    c.created_at, c.status, c.delivery_status,
+    c.from_address, c.to_addresses, c.cc_addresses,
+    c.bcc_addresses, c.reply_to, c.subject,
+    c.content_type, c.body, c.error,
+  ]);
+}
+
 // --- Live stats straight from Resend ------------------------------------
 async function getResendStats(env) {
   let body;
@@ -1088,7 +1392,7 @@ async function getD1Stats(env) {
     }
   } catch {}
   const topRecipients = Object.keys(recipCounts)
-    .map(function (k) { return [k, recipCounts[k]]; })
+    .map(function (k) { return [k, recip[k]]; })
     .sort(function (a, b) { return b[1] - a[1]; })
     .slice(0, 5);
 
@@ -2061,6 +2365,23 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
       (f.filtered ? "No messages match this search." : "No messages sent yet.") +
       "</p>";
 
+  // Import: a collapsed plain-HTML form at the bottom of the page. No
+  // script — the token rides in the action URL, since a multipart upload
+  // cannot set the X-Auth-Token header.
+  const importBox =
+    '<details class="import-box">' +
+    "<summary>Import from CSV</summary>" +
+    '<div class="card import-card">' +
+    '<p class="muted">Accepts a file in the exact format Export CSV writes. ' +
+    "Rows already in the archive — by id, Resend ID or full content — and " +
+    "identical rows inside the file are skipped, so importing never " +
+    "duplicates anything. Nothing is re-sent.</p>" +
+    '<form method="post" action="/sent/import' + tokenParam + '" enctype="multipart/form-data">' +
+    '<input type="file" name="csv" accept=".csv,text/csv" required> ' +
+    '<button type="submit" class="btn">Import</button>' +
+    "</form>" +
+    "</div></details>";
+
   const content = `
 <div class="page-head">
   <div class="head-row">
@@ -2074,7 +2395,8 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
 <div class="card">
  ${filterForm}
  ${items}
-</div>`;
+</div>
+ ${importBox}`;
 
   const extraCss = `
   .filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
@@ -2115,6 +2437,13 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
     padding: 12px;
     margin: 10px 0 0;
   }
+  .import-box { margin-top: 16px; }
+  .import-box summary { cursor: pointer; font-size: 13.5px; color: var(--muted); user-select: none; }
+  .import-box summary:hover { color: var(--fg); }
+  .import-card { margin-top: 10px; }
+  .import-card form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+  .import-card input[type="file"] { flex: 1 1 240px; padding: 8px; font-size: 13px; }
+  .import-card .btn { flex: none; }
 `;
 
   return renderShell({
@@ -2126,6 +2455,57 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
     content: content,
     extraCss: extraCss,
     script: "",
+  });
+}
+
+// Result page for the CSV import: what was stored, what was skipped and
+// why, or the reason nothing was imported at all. Plain HTML — no script.
+function renderImportResult(r, token, domains, showLogout) {
+  const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+  let body;
+  if (r.error) {
+    body =
+      '<div class="warn">' + escapeHtml(r.error) + "</div>" +
+      '<p class="muted">Nothing else was changed.</p>';
+  } else {
+    const invalid = r.invalid || [];
+    const notes = invalid
+      .slice(0, 5)
+      .map(function (n) { return "<li>" + escapeHtml(n) + "</li>"; })
+      .join("");
+    body =
+      (r.imported > 0
+        ? '<p class="ok-line">Imported ' + r.imported +
+          " message" + (r.imported === 1 ? "" : "s") + ".</p>"
+        : "<p>Nothing new to import — every valid row is already in the archive.</p>") +
+      (r.skipped > 0
+        ? "<p>Skipped " + r.skipped + " row" + (r.skipped === 1 ? "" : "s") +
+          " already in the archive or repeated in the file — only one copy of each is kept.</p>"
+        : "") +
+      (invalid.length > 0
+        ? "<p>Ignored " + invalid.length + " invalid row" + (invalid.length === 1 ? "" : "s") + ":</p>" +
+          "<ul>" + notes + "</ul>" +
+          (invalid.length > 5 ? '<p class="muted">…and ' + (invalid.length - 5) + " more.</p>" : "")
+        : "");
+  }
+  const content =
+    '<div class="page-head"><h1>Import sent messages</h1>' +
+    '<p class="sub">From a CSV in the export format</p></div>' +
+    '<div class="card">' + body +
+    '<p class="back-link"><a class="btn ghost small" href="/sent' + tokenParam +
+    '">Back to sent messages</a></p>' +
+    "</div>";
+  return renderShell({
+    title: "Import — Outbox",
+    active: "sent",
+    token: token,
+    domains: domains,
+    showLogout: showLogout,
+    width: "narrow",
+    content: content,
+    extraCss:
+      ".ok-line { color: var(--ok); font-weight: 600; }\n" +
+      ".back-link { margin-top: 18px; }",
   });
 }
 
@@ -2292,4 +2672,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-         }
+  }
