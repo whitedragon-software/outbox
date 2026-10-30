@@ -900,11 +900,12 @@ async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subje
 }
 
 // --- CSV import (POST /sent/import) --------------------------------------
-// Accepts a file in the exact format /sent/export writes and stores only
-// rows that are not already present: same id, same Resend ID, or — for
-// rows without a Resend ID — same full content. Identical rows inside the
-// file itself collapse to the first copy. Rows are skipped, never updated;
-// nothing is re-sent and Resend is never called.
+// Accepts a file in the exact format /sent/export writes and stores every
+// row that differs from what is already archived: only records identical
+// in every content field are skipped (matched by id, by Resend ID, or by
+// full content for rows without one). Identical rows inside the file
+// itself collapse to the first copy. Rows are never updated, nothing is
+// overwritten, nothing is re-sent and Resend is never called.
 async function handleImport(request, env, url, showLogout) {
   // POST auth like the other endpoints, plus the ?token= from the form's
   // action URL — a multipart upload cannot set the X-Auth-Token header.
@@ -1020,9 +1021,12 @@ async function handleImport(request, env, url, showLogout) {
   }
 
   // Duplicate check, pass 1 — bulk and cheap, chunked like reconciliation:
-  // which ids and which Resend IDs already exist in the archive?
+  // pull the full archived content of every row this file could collide
+  // with, by id and by Resend ID, so identical records can be recognized
+  // field by field instead of by identifier alone.
   const existingIds = new Set();
-  const existingRids = new Set();
+  const byId = new Map();
+  const byRid = new Map();
   try {
     const idVals = [];
     const ridVals = [];
@@ -1030,40 +1034,52 @@ async function handleImport(request, env, url, showLogout) {
       if (c.id !== null && idVals.indexOf(c.id) === -1) idVals.push(c.id);
       if (c.resend_id !== "" && ridVals.indexOf(c.resend_id) === -1) ridVals.push(c.resend_id);
     }
+    const fingerprintCols =
+      "id, resend_id, created_at, status, delivery_status, from_address, " +
+      "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, " +
+      "content_type, body, error";
     for (let i = 0; i < idVals.length; i += 50) {
       const chunk = idVals.slice(i, i + 50);
       const r = await env.DB.prepare(
-        "SELECT id FROM emails WHERE id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+        "SELECT " + fingerprintCols + " FROM emails WHERE id IN (" +
+        chunk.map(function () { return "?"; }).join(",") + ")"
       ).bind(...chunk).all();
-      for (const row of r.results || []) existingIds.add(row.id);
+      for (const row of r.results || []) {
+        existingIds.add(row.id);
+        byId.set(row.id, rowFingerprint(row));
+      }
     }
     for (let i = 0; i < ridVals.length; i += 50) {
       const chunk = ridVals.slice(i, i + 50);
       const r = await env.DB.prepare(
-        "SELECT resend_id FROM emails WHERE resend_id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+        "SELECT " + fingerprintCols + " FROM emails WHERE resend_id IN (" +
+        chunk.map(function () { return "?"; }).join(",") + ")"
       ).bind(...chunk).all();
-      for (const row of r.results || []) existingRids.add(row.resend_id);
+      for (const row of r.results || []) byRid.set(row.resend_id, rowFingerprint(row));
     }
   } catch (err) {
     return refuse("Could not read from D1: " + err.message, 500);
   }
 
-  // Pass 2 — decide. A row is stored only when nothing identical exists:
-  // not its id, not its Resend ID, and (when it has no Resend ID) not its
-  // full content. The seen-sets carry the same rule across the rows of
-  // this file, so a repeat inside the file collapses to the first copy.
-  const seenIds = new Set();
-  const seenRids = new Set();
+  // Pass 2 — decide. A row is stored whenever it differs from the archive
+  // in any content field; only a record identical in every field is
+  // skipped, whether it matches an archived row by id, by Resend ID, or —
+  // for rows without a Resend ID — by full content. The seen-set carries
+  // the same rule across the rows of this file, so a repeat inside the
+  // file collapses to the first copy.
   const seenContent = new Set();
   const toInsert = [];
   let skipped = 0;
   for (const c of candidates) {
-    if (c.id !== null && (existingIds.has(c.id) || seenIds.has(c.id))) { skipped++; continue; }
-    if (c.resend_id !== "" && (existingRids.has(c.resend_id) || seenRids.has(c.resend_id))) {
-      skipped++; continue;
-    }
     const key = importTupleKey(c);
-    if (seenContent.has(key)) { skipped++; continue; }
+    if (
+      seenContent.has(key) ||
+      (c.id !== null && byId.get(c.id) === key) ||
+      (c.resend_id !== "" && byRid.get(c.resend_id) === key)
+    ) {
+      skipped++;
+      continue;
+    }
     if (c.resend_id === "") {
       // No Resend ID to lean on — compare every archived field against the
       // archive. SQLite evaluates the cheap columns first, so bodies are
@@ -1090,14 +1106,15 @@ async function handleImport(request, env, url, showLogout) {
       }
     }
     seenContent.add(key);
-    if (c.resend_id !== "") seenRids.add(c.resend_id);
-    if (c.id !== null) seenIds.add(c.id);
     toInsert.push(c);
   }
 
-  // Pass 3 — store, in batches of 50. On a failure the rows already
-  // committed stay; the report says exactly how far it got, and a re-run
-  // skips everything that made it in.
+  // Pass 3 — store, in batches of 50. The CSV id is honoured when it is
+  // free; when it is already taken the row still goes in, just under a
+  // fresh autoincrement id — the archive is append-only, nothing is
+  // overwritten. On a failure the rows already committed stay; the report
+  // says exactly how far it got, and a re-run skips everything identical
+  // that made it in.
   let stored = 0;
   try {
     for (let i = 0; i < toInsert.length; i += 50) {
@@ -1105,7 +1122,7 @@ async function handleImport(request, env, url, showLogout) {
       for (const c of toInsert.slice(i, i + 50)) {
         const cols = [];
         const vals = [];
-        if (c.id !== null) { cols.push("id"); vals.push(c.id); }
+        if (c.id !== null && !existingIds.has(c.id)) { cols.push("id"); vals.push(c.id); }
         cols.push("resend_id", "from_address", "to_addresses", "cc_addresses",
           "bcc_addresses", "reply_to", "subject", "body", "content_type",
           "status", "error", "delivery_status");
@@ -1142,14 +1159,26 @@ async function handleImport(request, env, url, showLogout) {
 }
 
 // Content fingerprint for the import's duplicate check: every archived
-// field except the row id. Two records count as the same email when all
-// of these match.
+// field except the row id, including the Resend ID (empty when absent).
+// Two records count as the same email when all of these match.
 function importTupleKey(c) {
   return JSON.stringify([
     c.created_at, c.status, c.delivery_status,
     c.from_address, c.to_addresses, c.cc_addresses,
     c.bcc_addresses, c.reply_to, c.subject,
-    c.content_type, c.body, c.error,
+    c.content_type, c.body, c.error, c.resend_id,
+  ]);
+}
+
+// The same fingerprint for a row already in the archive, so an imported
+// record can be compared field by field against what is stored. NULL
+// columns normalize to "" to match how the CSV parser reads them.
+function rowFingerprint(r) {
+  return JSON.stringify([
+    r.created_at || "", r.status || "", r.delivery_status || "",
+    r.from_address || "", r.to_addresses || "", r.cc_addresses || "",
+    r.bcc_addresses || "", r.reply_to || "", r.subject || "",
+    r.content_type || "", r.body || "", r.error || "", r.resend_id || "",
   ]);
 }
 
@@ -2365,22 +2394,18 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
       (f.filtered ? "No messages match this search." : "No messages sent yet.") +
       "</p>";
 
-  // Import: a collapsed plain-HTML form at the bottom of the page. No
-  // script — the token rides in the action URL, since a multipart upload
-  // cannot set the X-Auth-Token header.
-  const importBox =
-    '<details class="import-box">' +
-    "<summary>Import from CSV</summary>" +
-    '<div class="card import-card">' +
-    '<p class="muted">Accepts a file in the exact format Export CSV writes. ' +
-    "Rows already in the archive — by id, Resend ID or full content — and " +
-    "identical rows inside the file are skipped, so importing never " +
-    "duplicates anything. Nothing is re-sent.</p>" +
-    '<form method="post" action="/sent/import' + tokenParam + '" enctype="multipart/form-data">' +
-    '<input type="file" name="csv" accept=".csv,text/csv" required> ' +
-    '<button type="submit" class="btn">Import</button>' +
-    "</form>" +
-    "</div></details>";
+  // Import lives in the head-row, right beside Export CSV: a plain-HTML
+  // multipart form — no script, the page keeps exactly the same inline
+  // scripts as before. The token rides in the action URL, since a file
+  // upload cannot set the X-Auth-Token header. Only records identical to
+  // what is already archived are skipped; anything that differs is written.
+  const importForm =
+    '<form class="import-form" method="post" action="/sent/import' + tokenParam + '" ' +
+    'enctype="multipart/form-data">' +
+    '<input type="file" name="csv" accept=".csv,text/csv" required ' +
+    'aria-label="CSV file to import" title="Import a CSV in the export format — identical records are skipped, differing rows are added.">' +
+    '<button type="submit" class="btn ghost small">Import CSV</button>' +
+    "</form>";
 
   const content = `
 <div class="page-head">
@@ -2389,20 +2414,31 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
       <h1>Sent messages</h1>
       ${sub}
     </div>
-    <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
+    <div class="head-actions">
+      ${importForm}
+      <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
+    </div>
   </div>
 </div>
 <div class="card">
  ${filterForm}
  ${items}
-</div>
- ${importBox}`;
+</div>`;
 
   const extraCss = `
   .filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
   .filter input[type="search"] { flex: 1 1 200px; width: auto; min-width: 0; }
   .filter select { flex: 0 0 auto; width: auto; }
   .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .import-form { display: flex; align-items: center; gap: 8px; }
+  .import-form input[type="file"] {
+    width: auto;
+    flex: 0 1 220px;
+    min-width: 0;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
   .msg summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -2437,13 +2473,6 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
     padding: 12px;
     margin: 10px 0 0;
   }
-  .import-box { margin-top: 16px; }
-  .import-box summary { cursor: pointer; font-size: 13.5px; color: var(--muted); user-select: none; }
-  .import-box summary:hover { color: var(--fg); }
-  .import-card { margin-top: 10px; }
-  .import-card form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
-  .import-card input[type="file"] { flex: 1 1 240px; padding: 8px; font-size: 13px; }
-  .import-card .btn { flex: none; }
 `;
 
   return renderShell({
@@ -2477,10 +2506,10 @@ function renderImportResult(r, token, domains, showLogout) {
       (r.imported > 0
         ? '<p class="ok-line">Imported ' + r.imported +
           " message" + (r.imported === 1 ? "" : "s") + ".</p>"
-        : "<p>Nothing new to import — every valid row is already in the archive.</p>") +
+        : "<p>Nothing new to import — every valid row is identical to what is already in the archive.</p>") +
       (r.skipped > 0
         ? "<p>Skipped " + r.skipped + " row" + (r.skipped === 1 ? "" : "s") +
-          " already in the archive or repeated in the file — only one copy of each is kept.</p>"
+          " identical to records already in the archive or repeated in the file — only one copy of each is kept.</p>"
         : "") +
       (invalid.length > 0
         ? "<p>Ignored " + invalid.length + " invalid row" + (invalid.length === 1 ? "" : "s") + ":</p>" +
@@ -2672,4 +2701,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-                       }
+    }
