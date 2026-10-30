@@ -9,6 +9,15 @@ const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
 const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_S * 1000;
 const LOGIN_FAIL_DELAY_MS = 500;
 
+// CSV import: the 14 columns /sent/export writes are the only header
+// /sent/import accepts, and uploads are capped before they are read.
+const IMPORT_COLUMNS = [
+  "id", "date", "status", "delivery_status", "resend_id", "from", "to",
+  "cc", "bcc", "reply_to", "subject", "content_type", "body", "error",
+];
+const IMPORT_MAX_MB = 25;
+const IMPORT_MAX_BYTES = IMPORT_MAX_MB * 1024 * 1024;
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -31,6 +40,40 @@ function csvField(v) {
   const s = String(v);
   if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
+}
+
+// The other half of csvField: parses a CSV string into rows of fields.
+// Quoted fields may contain commas, doubled quotes and line breaks; both
+// CRLF and LF end a record; a UTF-8 BOM, if present, is stripped.
+function parseCsv(text) {
+  const s = String(text || "").replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && s[i + 1] === "\n") i++;
+      row.push(field); field = "";
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
 }
 
 // "a@b.com, c@d.com " -> ["a@b.com", "c@d.com"]; empty pieces dropped.
@@ -240,7 +283,6 @@ async function getDomains(env) {
   } catch {}
   return [];
 }
-
 // --- Routing ------------------------------------------------------------
 export default {
   async fetch(request, env) {
@@ -346,8 +388,7 @@ export default {
       });
     }
 
-    // Sent-messages history (with search, and the import-result banner
-    // parameters that POST /sent/import redirects back with)
+    // Sent-messages history
     if (request.method === "GET" && url.pathname === "/sent") {
       const denied = await requirePage(request, env, url);
       if (denied) return denied;
@@ -361,68 +402,65 @@ export default {
 
       await ensureSchema(env);
 
-      // Search: a free-text query (matched against the message columns with
-      // LIKE, user wildcards escaped) and/or a status filter. With neither
-      // parameter the query is exactly what older builds ran.
+      // Search + filter. ?q= matches across the whole archive, ?status= is
+      // "sent" or "failed"; with neither present the query is exactly the
+      // old "newest 200". The pattern is always bound, never string-built,
+      // and % _ \ inside the search text are escaped so they stay literal
+      // (LIKE is case-insensitive for ASCII letters).
       const q = String(url.searchParams.get("q") || "").trim();
       const statusParam = String(url.searchParams.get("status") || "").trim();
-      const status = statusParam === "sent" || statusParam === "failed" ? statusParam : "";
+      const status =
+        statusParam === "sent" || statusParam === "failed" ? statusParam : "";
       const filtered = q !== "" || status !== "";
 
-      // Import outcome, carried here by the redirect after POST
-      // /sent/import. Any of the count parameters present means: show it.
-      const countParam = function (name) {
-        const v = url.searchParams.get(name);
-        return v !== null && /^\d+$/.test(v) ? parseInt(v, 10) : null;
-      };
-      const notice = {
-        imported: countParam("imported"),
-        updated: countParam("updated"),
-        dupes: countParam("dupes"),
-        invalid: countParam("invalid"),
-        errs: String(url.searchParams.get("errs") || ""),
-      };
-      const showNotice =
-        notice.imported !== null || notice.updated !== null ||
-        notice.dupes !== null || notice.invalid !== null;
+      let where = "";
+      const binds = [];
+      if (filtered) {
+        const clauses = [];
+        if (q !== "") {
+          const pattern =
+            "%" + q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_") + "%";
+          const likeCols = [
+            "subject", "body", "to_addresses", "cc_addresses", "bcc_addresses",
+            "from_address", "reply_to", "resend_id", "error",
+          ];
+          clauses.push(
+            "(" + likeCols.map(function (c) { return c + " LIKE ? ESCAPE '\\'"; }).join(" OR ") + ")"
+          );
+          likeCols.forEach(function () { binds.push(pattern); });
+        }
+        if (status !== "") {
+          clauses.push("status = ?");
+          binds.push(status);
+        }
+        where = " WHERE " + clauses.join(" AND ");
+      }
 
-      // History, the domain list and (when searching) the total match
-      // count are independent — read them all at once.
       let rows = [];
       let domains = [];
       let totalMatches = null;
       try {
-        const reads = [getDomains(env)];
+        // History and the domain list are independent — read both at once
+        // (plus the match count when a filter is active).
+        const rowsSql = "SELECT * FROM emails" + where + " ORDER BY id DESC LIMIT 200";
+        const reads = [
+          binds.length
+            ? env.DB.prepare(rowsSql).bind(...binds).all()
+            : env.DB.prepare(rowsSql).all(),
+          getDomains(env),
+        ];
         if (filtered) {
-          const where = [];
-          const binds = [];
-          if (q !== "") {
-            const likeCols = [
-              "subject", "body", "to_addresses", "cc_addresses", "bcc_addresses",
-              "from_address", "reply_to", "resend_id", "error",
-            ];
-            const pattern =
-              "%" + q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_") + "%";
-            where.push("(" + likeCols.map(function (c) { return c + " LIKE ? ESCAPE '\\'"; }).join(" OR ") + ")");
-            binds.push(pattern);
-          }
-          if (status !== "") {
-            where.push("status = ?");
-            binds.push(status);
-          }
-          const whereSql = where.length ? " WHERE " + where.join(" AND ") : "";
+          const countSql = "SELECT COUNT(*) AS c FROM emails" + where;
           reads.push(
-            env.DB.prepare("SELECT * FROM emails" + whereSql + " ORDER BY id DESC LIMIT 200")
-              .bind(...binds).all(),
-            env.DB.prepare("SELECT COUNT(*) AS c FROM emails" + whereSql).bind(...binds).first()
+            binds.length
+              ? env.DB.prepare(countSql).bind(...binds).first()
+              : env.DB.prepare(countSql).first()
           );
-        } else {
-          reads.push(env.DB.prepare("SELECT * FROM emails ORDER BY id DESC LIMIT 200").all());
         }
         const settled = await Promise.all(reads);
-        domains = settled[0];
-        rows = (settled[1] && settled[1].results) || [];
-        if (filtered) totalMatches = settled[2] ? (settled[2].c || 0) : rows.length;
+        rows = settled[0].results || [];
+        domains = settled[1];
+        totalMatches = filtered && settled[2] ? Number(settled[2].c || 0) : null;
       } catch (err) {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
@@ -433,8 +471,6 @@ export default {
           status: status,
           filtered: filtered,
           totalMatches: totalMatches,
-          notice: showNotice ? notice : null,
-          importError: String(url.searchParams.get("import_error") || ""),
         }),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
@@ -487,10 +523,11 @@ export default {
       });
     }
 
-    // Import sent emails from a CSV file — exactly the format
-    // GET /sent/export writes. Merged into the archive with dedup.
+    // Import sent emails from a CSV in the exact format /sent/export
+    // writes. A plain HTML form POST (multipart): the token rides in the
+    // action URL, since a file upload cannot set the X-Auth-Token header.
     if (request.method === "POST" && url.pathname === "/sent/import") {
-      return handleImport(request, env, url);
+      return handleImport(request, env, url, showLogout);
     }
 
     // Usage dashboard — reads live from Resend (with D1 as fallback)
@@ -863,130 +900,109 @@ async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subje
 }
 
 // --- CSV import (POST /sent/import) --------------------------------------
-// Accepts exactly the format GET /sent/export writes: the same 14 columns
-// (the header must name all of them, in any order), RFC 4180 quoting, UTF-8
-// with or without a BOM, CRLF or LF. Rows are merged into the archive, not
-// appended blindly: each row is matched against the stored data by id
-// first, then by resend_id. Identical rows are skipped as duplicates, rows
-// that differ on any content column are written over the stored row, and
-// only genuinely new rows are inserted. Nothing is ever re-sent through
-// Resend and no schema change is involved.
-
-const IMPORT_COLUMNS = [
-  "id", "date", "status", "delivery_status", "resend_id", "from", "to",
-  "cc", "bcc", "reply_to", "subject", "content_type", "body", "error",
-];
-const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
-
-const IMPORT_INSERT_SQL =
-  "INSERT INTO emails (id, created_at, status, delivery_status, resend_id, from_address, " +
-  "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, content_type, body, error) " +
-  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-const IMPORT_UPDATE_SQL =
-  "UPDATE emails SET created_at = ?, status = ?, delivery_status = ?, resend_id = ?, " +
-  "from_address = ?, to_addresses = ?, cc_addresses = ?, bcc_addresses = ?, reply_to = ?, " +
-  "subject = ?, content_type = ?, body = ?, error = ? WHERE id = ?";
-
-// null/undefined and "" are the same thing once a value leaves the database
-// or the CSV, so every comparison normalizes both sides through this.
-function normValue(v) {
-  return v === null || v === undefined ? "" : String(v);
-}
-
-// Parses a CSV string into rows of string fields. RFC 4180: a field may be
-// double-quoted and then contain commas, doubled quotes and newlines;
-// records end with CRLF, LF or a lone CR; the UTF-8 BOM is stripped.
-function parseCsv(text) {
-  const s = String(text || "").replace(/^\uFEFF/, "");
-  const rows = [];
-  let row = [];
-  let field = "";
-  let inQuotes = false;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (s[i + 1] === '"') { field += '"'; i++; }
-        else inQuotes = false;
-      } else {
-        field += ch;
-      }
-    } else if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === ",") {
-      row.push(field); field = "";
-    } else if (ch === "\r" || ch === "\n") {
-      row.push(field); field = "";
-      rows.push(row); row = [];
-      if (ch === "\r" && s[i + 1] === "\n") i++;
-    } else {
-      field += ch;
-    }
+// Accepts a file in the exact format /sent/export writes and stores only
+// rows that are not already present: same id, same Resend ID, or — for
+// rows without a Resend ID — same full content. Identical rows inside the
+// file itself collapse to the first copy. Rows are skipped, never updated;
+// nothing is re-sent and Resend is never called.
+async function handleImport(request, env, url, showLogout) {
+  // POST auth like the other endpoints, plus the ?token= from the form's
+  // action URL — a multipart upload cannot set the X-Auth-Token header.
+  const token = url.searchParams.get("token") || "";
+  const authed =
+    (await isAuthorized(request, env)) ||
+    (!!env.AUTH_TOKEN &&
+      (await constantTimeEqual(token, env.AUTH_TOKEN)));
+  if (!authed) {
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
   }
-  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
-  return rows;
-}
+  if (!env.DB) {
+    return new Response("No D1 database is bound as DB.", {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
 
-// Turns parsed CSV rows into validated records. Returns { error } for
-// structural problems that refuse the whole file, or { records, reasons,
-// invalid } — records ready to merge, reasons explaining every rejected
-// row by row number.
-function parseImportCsv(text) {
-  const rows = parseCsv(text);
-  if (rows.length === 0) return { error: "That file is empty." };
+  await ensureSchema(env);
 
-  const header = rows[0].map(function (c) { return c.trim().toLowerCase(); });
-  if (header.length !== IMPORT_COLUMNS.length) {
-    return {
-      error: "The header row must name exactly the " + IMPORT_COLUMNS.length +
-        " columns of an Outbox export (id, date, status, ...).",
-    };
+  const renderResult = async function (r, status) {
+    return new Response(
+      renderImportResult(r, token, await getDomains(env), showLogout),
+      {
+        status: status || 200,
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      }
+    );
+  };
+  const refuse = function (message, status) {
+    return renderResult({ error: message }, status);
+  };
+
+  // Cheap size gate on the declared upload size, before the body is read.
+  const declared = parseInt(request.headers.get("content-length") || "0", 10);
+  if (declared > IMPORT_MAX_BYTES + 4096) {
+    return refuse("That upload is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
+  }
+
+  let form = null;
+  try {
+    form = await request.formData();
+  } catch {}
+  const file = form ? form.get("csv") : null;
+  if (!file || typeof file === "string") {
+    return refuse("No file was uploaded — choose a CSV exported from the Sent page.", 400);
+  }
+  if (file.size > IMPORT_MAX_BYTES) {
+    return refuse("That file is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
+  }
+
+  const table = parseCsv(await file.text());
+  const records = table.filter(function (r) {
+    return r.length > 1 || (r.length === 1 && r[0].trim() !== "");
+  });
+  if (records.length < 2) {
+    return refuse("That file has no data rows — nothing was imported.", 400);
+  }
+
+  // The header must name the same 14 columns the export writes, in any
+  // order; anything else is refused before a single row is written.
+  const header = records[0].map(function (h) { return h.trim().toLowerCase(); });
+  const missing = IMPORT_COLUMNS.filter(function (name) { return header.indexOf(name) === -1; });
+  if (missing.length > 0) {
+    return refuse(
+      "The header row does not match the export format — missing column(s): " +
+        missing.join(", ") + ".",
+      400
+    );
   }
   const col = {};
-  for (let c = 0; c < header.length; c++) col[header[c]] = c;
-  for (const name of IMPORT_COLUMNS) {
-    if (col[name] === undefined) {
-      return {
-        error: 'The header row is missing the "' + name + '" column — this does not look like an Outbox export.',
-      };
-    }
-  }
+  IMPORT_COLUMNS.forEach(function (name) { col[name] = header.indexOf(name); });
 
-  const records = [];
-  const reasons = [];
-  let invalid = 0;
-  for (let r = 1; r < rows.length; r++) {
-    const cells = rows[r];
-    const rowNo = r + 1; // line number as a spreadsheet shows it
-    if (cells.length === 1 && cells[0].trim() === "") {
-      invalid++;
-      reasons.push("Row " + rowNo + ": empty row.");
-      continue;
-    }
-    if (cells.length !== IMPORT_COLUMNS.length) {
-      invalid++;
-      reasons.push("Row " + rowNo + ": expected " + IMPORT_COLUMNS.length + " columns, found " + cells.length + ".");
-      continue;
-    }
-    const cell = function (name) { return normValue(cells[col[name]]); };
-    const id = cell("id").trim();
-    if (id !== "" && !/^\d+$/.test(id)) {
-      invalid++;
-      reasons.push("Row " + rowNo + ": id must be empty or a number.");
+  // Row-by-row validation: status is the one hard rule. Everything else is
+  // stored as it arrives.
+  const candidates = [];
+  const invalid = [];
+  for (let i = 1; i < records.length; i++) {
+    const rec = records[i];
+    const cell = function (name) {
+      const v = rec[col[name]];
+      return v === undefined ? "" : String(v);
+    };
+    if (rec.length < header.length) {
+      invalid.push("record " + (i + 1) + ": fewer fields than the header");
       continue;
     }
     const status = cell("status").trim().toLowerCase();
     if (status !== "sent" && status !== "failed") {
-      invalid++;
-      reasons.push('Row ' + rowNo + ': status must be "sent" or "failed".');
+      invalid.push("record " + (i + 1) + ": status must be sent or failed");
       continue;
     }
-    records.push({
-      rowNo: rowNo,
-      id: id,
-      created_at: cell("date").trim(),
-      status: status,
-      delivery_status: cell("delivery_status").trim(),
+    const idRaw = cell("id").trim();
+    candidates.push({
+      id: /^[0-9]+$/.test(idRaw) ? parseInt(idRaw, 10) : null,
       resend_id: cell("resend_id").trim(),
       from_address: cell("from"),
       to_addresses: cell("to"),
@@ -994,284 +1010,147 @@ function parseImportCsv(text) {
       bcc_addresses: cell("bcc"),
       reply_to: cell("reply_to"),
       subject: cell("subject"),
-      content_type: cell("content_type").trim(),
       body: cell("body"),
+      content_type: cell("content_type").trim().toLowerCase(),
+      status: status,
       error: cell("error"),
+      delivery_status: cell("delivery_status").trim().toLowerCase(),
+      created_at: cell("date").trim(),
     });
   }
-  return { records: records, reasons: reasons, invalid: invalid };
-}
 
-// Two records are the same when every content column matches — everything
-// except the surrogate id. Works against stored rows and between rows of
-// one file alike.
-function sameRecord(a, b) {
-  return normValue(a.created_at) === normValue(b.created_at) &&
-    normValue(a.status) === normValue(b.status) &&
-    normValue(a.delivery_status) === normValue(b.delivery_status) &&
-    normValue(a.resend_id) === normValue(b.resend_id) &&
-    normValue(a.from_address) === normValue(b.from_address) &&
-    normValue(a.to_addresses) === normValue(b.to_addresses) &&
-    normValue(a.cc_addresses) === normValue(b.cc_addresses) &&
-    normValue(a.bcc_addresses) === normValue(b.bcc_addresses) &&
-    normValue(a.reply_to) === normValue(b.reply_to) &&
-    normValue(a.subject) === normValue(b.subject) &&
-    normValue(a.content_type) === normValue(b.content_type) &&
-    normValue(a.body) === normValue(b.body) &&
-    normValue(a.error) === normValue(b.error);
-}
+  // Duplicate check, pass 1 — bulk and cheap, chunked like reconciliation:
+  // which ids and which Resend IDs already exist in the archive?
+  const existingIds = new Set();
+  const existingRids = new Set();
+  try {
+    const idVals = [];
+    const ridVals = [];
+    for (const c of candidates) {
+      if (c.id !== null && idVals.indexOf(c.id) === -1) idVals.push(c.id);
+      if (c.resend_id !== "" && ridVals.indexOf(c.resend_id) === -1) ridVals.push(c.resend_id);
+    }
+    for (let i = 0; i < idVals.length; i += 50) {
+      const chunk = idVals.slice(i, i + 50);
+      const r = await env.DB.prepare(
+        "SELECT id FROM emails WHERE id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+      ).bind(...chunk).all();
+      for (const row of r.results || []) existingIds.add(row.id);
+    }
+    for (let i = 0; i < ridVals.length; i += 50) {
+      const chunk = ridVals.slice(i, i + 50);
+      const r = await env.DB.prepare(
+        "SELECT resend_id FROM emails WHERE resend_id IN (" + chunk.map(function () { return "?"; }).join(",") + ")"
+      ).bind(...chunk).all();
+      for (const row of r.results || []) existingRids.add(row.resend_id);
+    }
+  } catch (err) {
+    return refuse("Could not read from D1: " + err.message, 500);
+  }
 
-// Unambiguous content key for rows that carry neither id nor resend_id.
-function importContentKey(rec) {
-  return JSON.stringify([
-    rec.created_at, rec.status, rec.delivery_status, rec.resend_id,
-    rec.from_address, rec.to_addresses, rec.cc_addresses, rec.bcc_addresses,
-    rec.reply_to, rec.subject, rec.content_type, rec.body, rec.error,
-  ]);
-}
+  // Pass 2 — decide. A row is stored only when nothing identical exists:
+  // not its id, not its Resend ID, and (when it has no Resend ID) not its
+  // full content. The seen-sets carry the same rule across the rows of
+  // this file, so a repeat inside the file collapses to the first copy.
+  const seenIds = new Set();
+  const seenRids = new Set();
+  const seenContent = new Set();
+  const toInsert = [];
+  let skipped = 0;
+  for (const c of candidates) {
+    if (c.id !== null && (existingIds.has(c.id) || seenIds.has(c.id))) { skipped++; continue; }
+    if (c.resend_id !== "" && (existingRids.has(c.resend_id) || seenRids.has(c.resend_id))) {
+      skipped++; continue;
+    }
+    const key = importTupleKey(c);
+    if (seenContent.has(key)) { skipped++; continue; }
+    if (c.resend_id === "") {
+      // No Resend ID to lean on — compare every archived field against the
+      // archive. SQLite evaluates the cheap columns first, so bodies are
+      // only read for rows that already match on everything else.
+      try {
+        const dup = await env.DB.prepare(
+          "SELECT id FROM emails WHERE " +
+            "IFNULL(created_at,'') = ? AND status = ? AND IFNULL(delivery_status,'') = ? " +
+            "AND IFNULL(from_address,'') = ? AND IFNULL(to_addresses,'') = ? " +
+            "AND IFNULL(cc_addresses,'') = ? AND IFNULL(bcc_addresses,'') = ? " +
+            "AND IFNULL(reply_to,'') = ? AND subject = ? AND IFNULL(content_type,'') = ? " +
+            "AND IFNULL(body,'') = ? AND IFNULL(error,'') = ? LIMIT 1"
+        )
+          .bind(
+            c.created_at, c.status, c.delivery_status,
+            c.from_address, c.to_addresses, c.cc_addresses,
+            c.bcc_addresses, c.reply_to, c.subject,
+            c.content_type, c.body, c.error
+          )
+          .first();
+        if (dup) { skipped++; seenContent.add(key); continue; }
+      } catch (err) {
+        return refuse("Could not read from D1: " + err.message, 500);
+      }
+    }
+    seenContent.add(key);
+    if (c.resend_id !== "") seenRids.add(c.resend_id);
+    if (c.id !== null) seenIds.add(c.id);
+    toInsert.push(c);
+  }
 
-// Same key for a stored row — normalized, so NULL and "" hash the same.
-function storedRowContentKey(row) {
-  return importContentKey({
-    created_at: normValue(row.created_at),
-    status: normValue(row.status),
-    delivery_status: normValue(row.delivery_status),
-    resend_id: normValue(row.resend_id),
-    from_address: normValue(row.from_address),
-    to_addresses: normValue(row.to_addresses),
-    cc_addresses: normValue(row.cc_addresses),
-    bcc_addresses: normValue(row.bcc_addresses),
-    reply_to: normValue(row.reply_to),
-    subject: normValue(row.subject),
-    content_type: normValue(row.content_type),
-    body: normValue(row.body),
-    error: normValue(row.error),
+  // Pass 3 — store, in batches of 50. On a failure the rows already
+  // committed stay; the report says exactly how far it got, and a re-run
+  // skips everything that made it in.
+  let stored = 0;
+  try {
+    for (let i = 0; i < toInsert.length; i += 50) {
+      const batch = [];
+      for (const c of toInsert.slice(i, i + 50)) {
+        const cols = [];
+        const vals = [];
+        if (c.id !== null) { cols.push("id"); vals.push(c.id); }
+        cols.push("resend_id", "from_address", "to_addresses", "cc_addresses",
+          "bcc_addresses", "reply_to", "subject", "body", "content_type",
+          "status", "error", "delivery_status");
+        vals.push(
+          c.resend_id || null, c.from_address, c.to_addresses,
+          c.cc_addresses || null, c.bcc_addresses || null, c.reply_to || null,
+          c.subject, c.body, c.content_type || null, c.status,
+          c.error || null, c.delivery_status || null
+        );
+        if (c.created_at) { cols.push("created_at"); vals.push(c.created_at); }
+        batch.push(
+          env.DB.prepare(
+            "INSERT INTO emails (" + cols.join(", ") + ") VALUES (" +
+            cols.map(function () { return "?"; }).join(", ") + ")"
+          ).bind(...vals)
+        );
+      }
+      await env.DB.batch(batch);
+      stored += batch.length;
+    }
+  } catch (err) {
+    return renderResult({
+      error:
+        "The import stopped partway: " + err.message + " — " + stored + " of " +
+        toInsert.length + " rows were written (only the non-duplicates). Fix the file and import it again; what is already in the archive is skipped automatically.",
+    }, 500);
+  }
+
+  return renderResult({
+    imported: stored,
+    skipped: skipped,
+    invalid: invalid,
   });
 }
 
-// After the import the browser is sent back to /sent, which renders the
-// outcome as a banner. The token rides along so token-auth setups can
-// still open the page.
-function importRedirect(url, result, error) {
-  const params = new URLSearchParams();
-  const token = url.searchParams.get("token") || "";
-  if (token) params.set("token", token);
-  if (error) {
-    params.set("import_error", String(error).slice(0, 300));
-  } else {
-    params.set("imported", String(result.imported));
-    params.set("updated", String(result.updated));
-    params.set("dupes", String(result.dupes));
-    params.set("invalid", String(result.invalid));
-    if (result.reasons && result.reasons.length) {
-      let errs = result.reasons.slice(0, 3).join(" | ");
-      if (result.reasons.length > 3 || errs.length > 380) errs = errs.slice(0, 380) + "...";
-      params.set("errs", errs);
-    }
-  }
-  const qs = params.toString();
-  return redirect("/sent" + (qs ? "?" + qs : ""), 303);
-}
-
-// The import endpoint. A multipart upload cannot send the X-Auth-Token
-// header, so it authenticates like a page does: the PASSWORD session
-// cookie, or the ?token= carried in the form's action URL.
-async function handleImport(request, env, url) {
-  if (!(await pageAuthOk(request, env, url))) {
-    if (env.PASSWORD) return redirect("/login?next=" + encodeURIComponent("/sent"));
-    return new Response("Unauthorized", { status: 401 });
-  }
-  if (!env.DB) return importRedirect(url, null, "No D1 database is bound as DB.");
-  await ensureSchema(env);
-
-  let form;
-  try {
-    form = await request.formData();
-  } catch {
-    return importRedirect(url, null, "The upload could not be read.");
-  }
-  const file = form.get("file");
-  if (!file || typeof file === "string") {
-    return importRedirect(url, null, "Choose a CSV file first.");
-  }
-  if (file.size > MAX_IMPORT_BYTES) {
-    return importRedirect(url, null, "That file is larger than 25 MB — split it first.");
-  }
-
-  let text;
-  try {
-    text = await file.text();
-  } catch {
-    return importRedirect(url, null, "The file could not be read as text.");
-  }
-
-  const parsed = parseImportCsv(text);
-  if (parsed.error) return importRedirect(url, null, parsed.error);
-
-  const recs = parsed.records;
-  const reasons = parsed.reasons.slice();
-  let invalid = parsed.invalid;
-  let imported = 0;
-  let updated = 0;
-  let dupes = 0;
-
-  // Preload every stored row this file could touch — by id and by
-  // resend_id, in chunked lookups — instead of querying row by row.
-  const idNums = [];
-  const seenIds = new Set();
-  const resendIds = [];
-  const seenResends = new Set();
-  for (const rec of recs) {
-    if (rec.id !== "" && !seenIds.has(rec.id)) { seenIds.add(rec.id); idNums.push(Number(rec.id)); }
-    if (rec.resend_id !== "" && !seenResends.has(rec.resend_id)) {
-      seenResends.add(rec.resend_id);
-      resendIds.push(rec.resend_id);
-    }
-  }
-
-  const byId = new Map();
-  const byResend = new Map();
-  try {
-    for (let i = 0; i < idNums.length; i += 50) {
-      const chunk = idNums.slice(i, i + 50);
-      const marks = chunk.map(function () { return "?"; }).join(",");
-      const found = await env.DB.prepare("SELECT * FROM emails WHERE id IN (" + marks + ")")
-        .bind(...chunk).all();
-      for (const row of found.results || []) byId.set(Number(row.id), row);
-    }
-    for (let i = 0; i < resendIds.length; i += 50) {
-      const chunk = resendIds.slice(i, i + 50);
-      const marks = chunk.map(function () { return "?"; }).join(",");
-      const found = await env.DB.prepare("SELECT * FROM emails WHERE resend_id IN (" + marks + ")")
-        .bind(...chunk).all();
-      for (const row of found.results || []) {
-        if (!byResend.has(row.resend_id)) byResend.set(row.resend_id, row);
-      }
-    }
-  } catch (err) {
-    return importRedirect(url, null, "Could not read the database: " + err.message);
-  }
-
-  // Rows that carry neither id nor resend_id can only be recognized by
-  // their content. Real exports always carry an id, so this only kicks in
-  // for hand-built files: when one is present, the archive's content keys
-  // are loaded once and compared in memory.
-  const needsContentScan = recs.some(function (r) { return r.id === "" && r.resend_id === ""; });
-  const storedContentKeys = new Set();
-  if (needsContentScan) {
-    try {
-      const all = await env.DB.prepare(
-        "SELECT id, created_at, status, delivery_status, resend_id, from_address, " +
-        "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, content_type, body, error " +
-        "FROM emails"
-      ).all();
-      for (const row of all.results || []) storedContentKeys.add(storedRowContentKey(row));
-    } catch (err) {
-      return importRedirect(url, null, "Could not read the database: " + err.message);
-    }
-  }
-
-  // First pass: decide, don't write. The first occurrence of a record in
-  // the file wins — later identical rows count as duplicates, later
-  // conflicting ones are rejected with a reason.
-  const nowSql = new Date().toISOString().slice(0, 19).replace("T", " ");
-  const pendingById = new Map();
-  const pendingByResend = new Map();
-  const pendingContent = new Map();
-  const insertBinds = [];
-  const updateBinds = [];
-
-  for (const rec of recs) {
-    const idNum = rec.id === "" ? null : Number(rec.id);
-    const pending =
-      idNum !== null && pendingById.has(idNum) ? pendingById.get(idNum) :
-      rec.resend_id !== "" && pendingByResend.has(rec.resend_id) ? pendingByResend.get(rec.resend_id) :
-      null;
-    if (pending) {
-      if (sameRecord(rec, pending)) {
-        dupes++;
-      } else {
-        invalid++;
-        reasons.push(
-          "Row " + rec.rowNo + ": " + (idNum !== null ? "id" : "Resend ID") +
-          " repeats row " + pending.rowNo + " with different content — keeping row " + pending.rowNo + "."
-        );
-      }
-      continue;
-    }
-    if (idNum === null && rec.resend_id === "") {
-      const key = importContentKey(rec);
-      if (pendingContent.has(key) || storedContentKeys.has(key)) { dupes++; continue; }
-      pendingContent.set(key, true);
-    }
-
-    const stored =
-      idNum !== null && byId.has(idNum) ? byId.get(idNum) :
-      rec.resend_id !== "" && byResend.has(rec.resend_id) ? byResend.get(rec.resend_id) :
-      null;
-
-    if (stored) {
-      if (sameRecord(stored, rec)) {
-        dupes++;
-      } else {
-        // Same id or resend_id but something differs — write the difference.
-        updateBinds.push([
-          rec.created_at !== "" ? rec.created_at : normValue(stored.created_at),
-          rec.status,
-          rec.delivery_status === "" ? null : rec.delivery_status,
-          rec.resend_id === "" ? null : rec.resend_id,
-          rec.from_address,
-          rec.to_addresses,
-          rec.cc_addresses === "" ? null : rec.cc_addresses,
-          rec.bcc_addresses === "" ? null : rec.bcc_addresses,
-          rec.reply_to === "" ? null : rec.reply_to,
-          rec.subject,
-          rec.content_type === "" ? null : rec.content_type,
-          rec.body,
-          rec.error === "" ? null : rec.error,
-          stored.id,
-        ]);
-        updated++;
-      }
-    } else {
-      insertBinds.push([
-        idNum,
-        rec.created_at !== "" ? rec.created_at : nowSql,
-        rec.status,
-        rec.delivery_status === "" ? null : rec.delivery_status,
-        rec.resend_id === "" ? null : rec.resend_id,
-        rec.from_address,
-        rec.to_addresses,
-        rec.cc_addresses === "" ? null : rec.cc_addresses,
-        rec.bcc_addresses === "" ? null : rec.bcc_addresses,
-        rec.reply_to === "" ? null : rec.reply_to,
-        rec.subject,
-        rec.content_type === "" ? null : rec.content_type,
-        rec.body,
-        rec.error === "" ? null : rec.error,
-      ]);
-      imported++;
-    }
-    if (idNum !== null) pendingById.set(idNum, rec);
-    if (rec.resend_id !== "") pendingByResend.set(rec.resend_id, rec);
-  }
-
-  // Second pass: run the writes in batches. D1 batches are atomic, so a
-  // failed batch leaves its own rows unwritten instead of half-applied.
-  if (insertBinds.length || updateBinds.length) {
-    try {
-      const statements = [];
-      for (const b of insertBinds) statements.push(env.DB.prepare(IMPORT_INSERT_SQL).bind(...b));
-      for (const b of updateBinds) statements.push(env.DB.prepare(IMPORT_UPDATE_SQL).bind(...b));
-      for (let i = 0; i < statements.length; i += 50) {
-        await env.DB.batch(statements.slice(i, i + 50));
-      }
-    } catch (err) {
-      return importRedirect(url, null, "Could not write to the database: " + err.message);
-    }
-  }
-
-  return importRedirect(url, { imported: imported, updated: updated, dupes: dupes, invalid: invalid, reasons: reasons });
+// Content fingerprint for the import's duplicate check: every archived
+// field except the row id. Two records count as the same email when all
+// of these match.
+function importTupleKey(c) {
+  return JSON.stringify([
+    c.created_at, c.status, c.delivery_status,
+    c.from_address, c.to_addresses, c.cc_addresses,
+    c.bcc_addresses, c.reply_to, c.subject,
+    c.content_type, c.body, c.error,
+  ]);
 }
 
 // --- Live stats straight from Resend ------------------------------------
@@ -1513,7 +1392,7 @@ async function getD1Stats(env) {
     }
   } catch {}
   const topRecipients = Object.keys(recipCounts)
-    .map(function (k) { return [k, recipCounts[k]]; })
+    .map(function (k) { return [k, recip[k]]; })
     .sort(function (a, b) { return b[1] - a[1]; })
     .slice(0, 5);
 
@@ -1597,7 +1476,6 @@ async function syncDeliveryStatuses(env) {
   }
   return { checked, byStatus };
 }
-
 // --- Pages: shared dashboard shell --------------------------------------
 // All pages render through renderShell(): sidebar navigation on desktop
 // that collapses into a sticky top bar with tab navigation below 860px,
@@ -2422,14 +2300,35 @@ function renderDomainsPage(domains, token, showLogout) {
   });
 }
 
-// The /sent page: import and export sit together in the page head, the
-// search form sits at the top of the card, then the message list. Plain
-// HTML only — no inline script runs on this page.
-// view: { q, status, filtered, totalMatches, notice, importError } — the
-// last two carry the outcome shown after POST /sent/import.
-function renderSentPage(rows, token, domains, showLogout, view) {
-  const v = view || { q: "", status: "", filtered: false, totalMatches: null, notice: null, importError: "" };
+function renderSentPage(rows, token, domains, showLogout, filter) {
   const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+  const f = filter || { q: "", status: "", filtered: false, totalMatches: null };
+
+  // Header line: the match count when searching/filtering, the old
+  // "Last N messages" line otherwise.
+  const sub = f.filtered && f.totalMatches !== null
+    ? '<p class="sub">' + f.totalMatches + " match" + (f.totalMatches === 1 ? "" : "es") +
+      " across the whole archive" +
+      (f.totalMatches > rows.length ? " — showing the newest " + rows.length + "." : ".") +
+      "</p>"
+    : '<p class="sub">Last ' + rows.length + " message" + (rows.length === 1 ? "" : "s") +
+      " (most recent first).</p>";
+
+  // Plain-HTML GET form — the sent page stays script-free. The token rides
+  // along in a hidden field so AUTH_TOKEN-only setups keep working.
+  const filterForm =
+    '<form class="filter" method="get" action="/sent">' +
+    (token ? '<input type="hidden" name="token" value="' + escapeHtml(token) + '">' : "") +
+    '<input type="search" name="q" value="' + escapeHtml(f.q) +
+    '" placeholder="Search subject, body, addresses, error…" aria-label="Search sent messages">' +
+    '<select name="status" aria-label="Filter by status">' +
+    '<option value=""' + (f.status === "" ? " selected" : "") + ">All statuses</option>" +
+    '<option value="sent"' + (f.status === "sent" ? " selected" : "") + ">Sent</option>" +
+    '<option value="failed"' + (f.status === "failed" ? " selected" : "") + ">Failed</option>" +
+    "</select>" +
+    '<button type="submit" class="btn small">Search</button>' +
+    (f.filtered ? '<a class="btn ghost small" href="/sent' + tokenParam + '">Clear</a>' : "") +
+    "</form>";
 
   const items = rows.length
     ? rows
@@ -2462,109 +2361,48 @@ function renderSentPage(rows, token, domains, showLogout, view) {
           );
         })
         .join("")
-    : '<p class="muted">' + (v.filtered ? "No messages match this search." : "No messages sent yet.") + "</p>";
+    : '<p class="muted">' +
+      (f.filtered ? "No messages match this search." : "No messages sent yet.") +
+      "</p>";
 
-  const matches = v.totalMatches === null ? rows.length : v.totalMatches;
-  const sub = v.filtered
-    ? "Found " + matches + " matching message" + (matches === 1 ? "" : "s") +
-      (matches > rows.length ? " — showing the newest 200." : ".")
-    : "Last " + rows.length + " message" + (rows.length === 1 ? "" : "s") + " (most recent first).";
+  // Import: a collapsed plain-HTML form at the bottom of the page. No
+  // script — the token rides in the action URL, since a multipart upload
+  // cannot set the X-Auth-Token header.
+  const importBox =
+    '<details class="import-box">' +
+    "<summary>Import from CSV</summary>" +
+    '<div class="card import-card">' +
+    '<p class="muted">Accepts a file in the exact format Export CSV writes. ' +
+    "Rows already in the archive — by id, Resend ID or full content — and " +
+    "identical rows inside the file are skipped, so importing never " +
+    "duplicates anything. Nothing is re-sent.</p>" +
+    '<form method="post" action="/sent/import' + tokenParam + '" enctype="multipart/form-data">' +
+    '<input type="file" name="csv" accept=".csv,text/csv" required> ' +
+    '<button type="submit" class="btn">Import</button>' +
+    "</form>" +
+    "</div></details>";
 
-  // Import lives right beside Export: a plain multipart form — the file
-  // picker plus the Import button — with ?token= in the action, because a
-  // multipart upload cannot send the X-Auth-Token header.
-  const importForm =
-    '<form class="import-form" method="POST" action="/sent/import' + tokenParam + '" enctype="multipart/form-data">' +
-    '<input class="file-input" type="file" name="file" accept=".csv,text/csv" required aria-label="CSV file to import">' +
-    '<button type="submit" class="btn small">Import</button>' +
-    "</form>";
-
-  const filterForm =
-    '<form class="filter-form" method="GET" action="/sent">' +
-    (token ? '<input type="hidden" name="token" value="' + escapeHtml(token) + '">' : "") +
-    '<input type="search" name="q" value="' + escapeHtml(v.q) + '" placeholder="Search subject, body, addresses, error..." aria-label="Search sent messages">' +
-    '<select name="status" aria-label="Filter by status">' +
-    '<option value=""' + (v.status === "" ? " selected" : "") + ">All</option>" +
-    '<option value="sent"' + (v.status === "sent" ? " selected" : "") + ">Sent</option>" +
-    '<option value="failed"' + (v.status === "failed" ? " selected" : "") + ">Failed</option>" +
-    "</select>" +
-    '<button type="submit" class="btn small">Search</button>' +
-    (v.filtered ? '<a class="btn ghost small" href="/sent' + tokenParam + '">Clear</a>' : "") +
-    "</form>";
-
-  let banner = "";
-  if (v.importError) {
-    banner =
-      '<div class="import-notice bad"><strong>Import failed:</strong> ' +
-      escapeHtml(v.importError) + "</div>";
-  } else if (v.notice) {
-    const n = v.notice;
-    const parts = [];
-    if (n.imported) parts.push(n.imported + " new");
-    if (n.updated) parts.push(n.updated + " updated");
-    if (n.dupes) parts.push(n.dupes + " duplicate" + (n.dupes === 1 ? "" : "s") + " skipped");
-    if (n.invalid) parts.push(n.invalid + " invalid");
-    banner =
-      '<div class="import-notice' + (n.invalid ? " bad" : "") + '"><strong>Import finished:</strong> ' +
-      escapeHtml(parts.length ? parts.join(", ") : "nothing to change") + "." +
-      (n.errs ? '<div class="reasons">' + escapeHtml(n.errs) + "</div>" : "") +
-      "</div>";
-  }
-
-  const content =
-    '<div class="page-head"><div class="head-row">' +
-    '<div><h1>Sent messages</h1><p class="sub">' + sub + "</p></div>" +
-    '<div class="head-actions">' +
-    importForm +
-    '<a class="btn ghost small" href="/sent/export' + tokenParam + '">Export CSV</a>' +
-    "</div></div></div>" +
-    '<div class="card">' +
-    banner +
-    filterForm +
-    items +
-    "</div>";
+  const content = `
+<div class="page-head">
+  <div class="head-row">
+    <div>
+      <h1>Sent messages</h1>
+      ${sub}
+    </div>
+    <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
+  </div>
+</div>
+<div class="card">
+ ${filterForm}
+ ${items}
+</div>
+ ${importBox}`;
 
   const extraCss = `
+  .filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
+  .filter input[type="search"] { flex: 1 1 200px; width: auto; min-width: 0; }
+  .filter select { flex: 0 0 auto; width: auto; }
   .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
-  .head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .import-form { display: flex; align-items: center; gap: 8px; }
-  .import-form input[type="file"] {
-    width: auto;
-    max-width: 100%;
-    padding: 5px 8px;
-    font-size: 12.5px;
-    color: var(--muted);
-    background: var(--ghost-bg);
-    border: 1px solid var(--border-strong);
-    border-radius: 8px;
-    cursor: pointer;
-  }
-  .import-form input[type="file"]::file-selector-button {
-    font: inherit;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--fg);
-    background: var(--ghost-bg);
-    border: 1px solid var(--border-strong);
-    border-radius: 7px;
-    padding: 6px 10px;
-    margin: 0 8px 0 0;
-    cursor: pointer;
-  }
-  .import-form input[type="file"]::file-selector-button:hover { background: var(--ghost-hover); }
-  .filter-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; }
-  .filter-form input[type="search"] { flex: 1 1 200px; min-width: 0; }
-  .filter-form select { flex: 0 0 auto; width: auto; cursor: pointer; }
-  .filter-form .btn { flex: none; }
-  .import-notice {
-    border: 1px solid var(--ok);
-    border-radius: 8px;
-    padding: 10px 14px;
-    font-size: 13.5px;
-    margin: 0 0 16px;
-  }
-  .import-notice.bad { border-color: var(--err); }
-  .import-notice .reasons { color: var(--muted); font-size: 12.5px; margin-top: 4px; overflow-wrap: anywhere; }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
   .msg summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -2599,6 +2437,13 @@ function renderSentPage(rows, token, domains, showLogout, view) {
     padding: 12px;
     margin: 10px 0 0;
   }
+  .import-box { margin-top: 16px; }
+  .import-box summary { cursor: pointer; font-size: 13.5px; color: var(--muted); user-select: none; }
+  .import-box summary:hover { color: var(--fg); }
+  .import-card { margin-top: 10px; }
+  .import-card form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+  .import-card input[type="file"] { flex: 1 1 240px; padding: 8px; font-size: 13px; }
+  .import-card .btn { flex: none; }
 `;
 
   return renderShell({
@@ -2610,6 +2455,57 @@ function renderSentPage(rows, token, domains, showLogout, view) {
     content: content,
     extraCss: extraCss,
     script: "",
+  });
+}
+
+// Result page for the CSV import: what was stored, what was skipped and
+// why, or the reason nothing was imported at all. Plain HTML — no script.
+function renderImportResult(r, token, domains, showLogout) {
+  const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
+  let body;
+  if (r.error) {
+    body =
+      '<div class="warn">' + escapeHtml(r.error) + "</div>" +
+      '<p class="muted">Nothing else was changed.</p>';
+  } else {
+    const invalid = r.invalid || [];
+    const notes = invalid
+      .slice(0, 5)
+      .map(function (n) { return "<li>" + escapeHtml(n) + "</li>"; })
+      .join("");
+    body =
+      (r.imported > 0
+        ? '<p class="ok-line">Imported ' + r.imported +
+          " message" + (r.imported === 1 ? "" : "s") + ".</p>"
+        : "<p>Nothing new to import — every valid row is already in the archive.</p>") +
+      (r.skipped > 0
+        ? "<p>Skipped " + r.skipped + " row" + (r.skipped === 1 ? "" : "s") +
+          " already in the archive or repeated in the file — only one copy of each is kept.</p>"
+        : "") +
+      (invalid.length > 0
+        ? "<p>Ignored " + invalid.length + " invalid row" + (invalid.length === 1 ? "" : "s") + ":</p>" +
+          "<ul>" + notes + "</ul>" +
+          (invalid.length > 5 ? '<p class="muted">…and ' + (invalid.length - 5) + " more.</p>" : "")
+        : "");
+  }
+  const content =
+    '<div class="page-head"><h1>Import sent messages</h1>' +
+    '<p class="sub">From a CSV in the export format</p></div>' +
+    '<div class="card">' + body +
+    '<p class="back-link"><a class="btn ghost small" href="/sent' + tokenParam +
+    '">Back to sent messages</a></p>' +
+    "</div>";
+  return renderShell({
+    title: "Import — Outbox",
+    active: "sent",
+    token: token,
+    domains: domains,
+    showLogout: showLogout,
+    width: "narrow",
+    content: content,
+    extraCss:
+      ".ok-line { color: var(--ok); font-weight: 600; }\n" +
+      ".back-link { margin-top: 18px; }",
   });
 }
 
@@ -2776,4 +2672,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-  }
+                       }
