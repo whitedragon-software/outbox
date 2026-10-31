@@ -2394,17 +2394,25 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
       (f.filtered ? "No messages match this search." : "No messages sent yet.") +
       "</p>";
 
-  // Import lives in the head-row, right beside Export CSV: a plain-HTML
-  // multipart form — no script, the page keeps exactly the same inline
-  // scripts as before. The token rides in the action URL, since a file
-  // upload cannot set the X-Auth-Token header. Only records identical to
-  // what is already archived are skipped; anything that differs is written.
+  // Import lives in the head-row, right beside Export CSV, and there is no
+  // visible file field — no browser "No file chosen" box. The "Import CSV"
+  // label is the button: clicking it opens the native file picker directly,
+  // and choosing a file submits the form at once via a single inline
+  // onchange attribute (not a <script> block, so the page still carries no
+  // script of its own). The file input stays in the DOM, visually hidden
+  // but keyboard-focusable, so Tab + Enter opens the picker too. The token
+  // rides in the action URL, since a multipart upload cannot set the
+  // X-Auth-Token header. Only records identical to what is already
+  // archived are skipped; anything that differs is written.
   const importForm =
     '<form class="import-form" method="post" action="/sent/import' + tokenParam + '" ' +
     'enctype="multipart/form-data">' +
-    '<input type="file" name="csv" accept=".csv,text/csv" required ' +
-    'aria-label="CSV file to import" title="Import a CSV in the export format — identical records are skipped, differing rows are added.">' +
-    '<button type="submit" class="btn ghost small">Import CSV</button>' +
+    '<input id="import-csv" type="file" name="csv" accept=".csv,text/csv" ' +
+    'aria-label="CSV file to import" ' +
+    'onchange="if (this.files.length) this.form.submit()">' +
+    '<label for="import-csv" class="btn ghost small" ' +
+    'title="Import a CSV in the export format — identical records are skipped, differing rows are added.">' +
+    "Import CSV</label>" +
     "</form>";
 
   const content = `
@@ -2431,13 +2439,28 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
   .filter select { flex: 0 0 auto; width: auto; }
   .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
   .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .import-form { display: flex; align-items: center; gap: 8px; }
+  .import-form { display: flex; align-items: center; gap: 0; }
+  /* The file input is visually hidden but still focusable: keyboard users
+     tab to it and press Enter to open the picker, like any native input.
+     The label next to it acts as the Import button. */
   .import-form input[type="file"] {
-    width: auto;
-    flex: 0 1 220px;
-    min-width: 0;
-    padding: 6px 8px;
-    font-size: 13px;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .import-form label {
+    display: inline-block;
+    margin: 0;
+  }
+  .import-form:focus-within label {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
   }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
