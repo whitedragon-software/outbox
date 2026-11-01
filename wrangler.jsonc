@@ -1,5 +1,12 @@
 {
   "name": "outbox",
   "main": "_worker.js",
-  "compatibility_date": "2026-10-01",
+  "compatibility_date": "2025-01-01",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_id": "3152b7cc-90b7-471d-a0cc-808e166789d3"
+    }
+  ]
 }
