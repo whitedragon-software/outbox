@@ -2,12 +2,13 @@
 
 A single-file Cloudflare Worker that sends email through Resend from your own
 domains: a compose form (To, CC and BCC) with live HTML preview, a complete
-send history in D1 with rendered previews, whole-archive search and one-click
-CSV export, and a usage dashboard that reads live from Resend so the numbers
-always match the provider's. All four pages share one dashboard shell —
-sidebar navigation on desktop, a top bar on mobile — with a light/dark theme
-toggle, light by default. Optional password login; the sending-domain list
-lives in the database and is managed entirely from the dashboard.
+send history in D1 with rendered previews, whole-archive search, one-click
+CSV export and import, and a usage dashboard that reads live from Resend so
+the numbers always match the provider's. All four pages share one dashboard
+shell — sidebar navigation on desktop, a top bar on mobile — with a
+light/dark theme toggle, light by default. Optional password login; the
+sending-domain list lives in the database and is managed entirely from the
+dashboard.
 
 ```
 https://outbox.<username>.workers.dev/
@@ -97,6 +98,7 @@ browsers where cookies get wiped.
 | `/logout` | Clears the session cookie (the sidebar's "Log out" link). |
 | `/sent` | History, newest first, with search and an All / Sent / Failed filter; click a message to expand the full body. |
 | `/sent/export` | CSV of the full send history (the "Export CSV" link on `/sent`). |
+| `POST /sent/import` | CSV back into the archive (the "Import CSV" button on `/sent`) — adds rows, skips identical ones, never re-sends. |
 | `/usage` | Live usage dashboard, read from Resend on every load. |
 | `/domains` | The sending-domain list — add, remove, set the default. |
 | `POST /send` | JSON API. Token in the `X-Auth-Token` header, or the session cookie. |
@@ -109,7 +111,8 @@ Pages take the token via `?token=`; the form and dashboard then pass it
 along in the `X-Auth-Token` header automatically, so links between pages
 keep working. With `PASSWORD` set and no `AUTH_TOKEN`, the POST endpoints
 need the session cookie — programmatic callers must log in first and send
-the cookie along.
+the cookie along. The import form is the one exception: a file upload can't
+set headers, so its action carries `?token=` like a page link.
 
 ---
 
@@ -167,6 +170,19 @@ plain GET — it works with JavaScript disabled and carries the `?token=`
 along in a hidden field — and **Export CSV** always exports everything,
 search or not.
 
+Import goes the other way: the **Import CSV** button beside *Export CSV*
+posts a file back to `POST /sent/import`. It accepts exactly the export's
+format — the same 14 columns in any order, as long as every name is
+present — and refuses anything else (a wrong header, a non-CSV file,
+anything over 25 MB) before writing a single row. Records already in the
+archive are skipped when identical in every content field; a row that
+differs in any of them is added, and the CSV's `id` is reused only when it
+is still free. Nothing is ever re-sent — importing never calls Resend —
+and a result page reports how many rows were imported, skipped or invalid,
+with a reason for every rejection. Clicking the button opens the file
+picker directly and picking a file submits at once: one click end to end,
+with a single inline `onchange` as the only JavaScript.
+
 ---
 
 ## How it works
@@ -209,7 +225,18 @@ failure never turns a delivered email into an error: the form shows a
 "could not save to history" warning instead. When both `text` and `html`
 are sent, the HTML part is what gets archived. The whole table exports as
 CSV from `/sent/export`, authed like the pages so the `?token=` travels
-with the link.
+with the link — and imports back the same way at `/sent/import`: a
+multipart upload parsed with the same RFC 4180 rules, validated against
+the export's 14-column header, and written in batches of 50 through
+`DB.batch`. Duplicate protection compares each row's full content —
+timestamp, status, delivery status, from, to, cc, bcc, reply-to, subject,
+content type, body, error and Resend ID — against the archive (by `id`, by
+Resend ID, or by full content when the row carries neither) and against
+earlier rows of the same file: only records identical in every field are
+skipped, and anything that differs is appended, under a fresh id whenever
+the CSV's own id is already taken. Imports only ever add — nothing in the
+archive is updated or deleted, Resend is never called, and no schema
+change is involved.
 
 **Usage.** `/usage` calls Resend's list endpoint on every page load and
 computes all numbers from Resend's own records — the one exception is
@@ -268,7 +295,8 @@ login page's toggle — the login form itself is plain HTML, no script), the
 compose script, the usage script and the domains script. The `${...}`
 substitutions (`DOMAINS`, `TOKEN`) are Worker-side interpolations —
 runtime-valid but invalid standalone JavaScript — so the extraction
-replaces them with `null` before checking.
+replaces them with `null` before checking. The import form adds no script
+block: its auto-submit is one inline `onchange` attribute.
 
 ---
 
@@ -325,6 +353,12 @@ replaces them with `null` before checking.
     to *Failed* — only failures match — and a `%` or `_` in the box matches
     literally, not as a wildcard. *Clear* brings back the plain newest-200
     view, and the page looks exactly as it did before searching.
+15. `/sent` → *Import CSV*: import the file you just exported — every row
+    is skipped as identical and the result page says so. Change one cell
+    in one row (a subject word, say) and import again — that row is added
+    under a fresh id while the rest are skipped. Try a non-CSV file or a
+    renamed column header: refused with a message before anything is
+    written, and nothing ever re-sends.
 
 ---
 
@@ -349,9 +383,15 @@ replaces them with `null` before checking.
   Adding a domain here only puts it on Outbox's list: Resend still has to
   verify it (their dashboard), otherwise you get Resend's 403.
 - The CSV export is the D1 archive, not a copy of the original mail:
-  bodies are single-part (only the HTML part when both were sent), and the
-  file isn't re-importable as email. The whole table ships in one response,
-  so a very large history could hit D1's response-size cap.
+  bodies are single-part (only the HTML part when both were sent), so the
+  file isn't re-importable *as email* — but it does round-trip into the
+  archive through *Import CSV*, which restores the rows without re-sending
+  anything. The whole table ships in one response, so a very large history
+  could hit D1's response-size cap; imports are capped the same way at
+  25 MB per file — split larger exports before bringing them back.
+- Import accepts only Outbox's own export format — the same 14 column
+  names, header row required. Migrations from other tools mean reworking
+  the file into that shape first.
 - `/usage` shows the **100 most recent** sends Resend has on record; older
   history is not included (the page says so when it applies). Each page
   view costs one Resend API read, which counts against their rate limits.
