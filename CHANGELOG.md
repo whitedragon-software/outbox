@@ -4,44 +4,38 @@
 
 ### Added
 - CSV import of the send history: an "Import CSV" button beside
-  "Export CSV" on `/sent`, posting the chosen file to
-  `POST /sent/import` (`multipart/form-data`, field `csv`). The form
-  action carries `?token=` — a file upload can't send the
-  `X-Auth-Token` header — and a password session works as on every
-  other page. The parser reads exactly what the export writes: the
-  same 14 columns — `id`, `date`, `status`, `delivery_status`,
-  `resend_id`, `from`, `to`, `cc`, `bcc`, `reply_to`, `subject`,
-  `content_type`, `body`, `error` — in any column order, as long as
-  every name is present, with RFC 4180 quoting, an optional UTF-8 BOM
-  and CRLF or LF line endings. Files over 25 MB, non-CSV uploads and
-  wrong headers are refused before anything is written, and `status`
-  must be `sent` or `failed`. Rows are inserted in batches of 50
-  through `DB.batch`; a result page then reports how many rows were
-  imported, skipped or invalid, with a reason for every rejection.
-  Nothing is re-sent — importing never calls Resend — and no schema
-  change or migration is needed.
+  "Export CSV" on `/sent`, posting the picked file to
+  `POST /sent/import` (authed like the pages — the form action carries
+  `?token=`, because a file upload can't set the `X-Auth-Token`
+  header, and a password session works as everywhere else). The parser
+  reads exactly what the export writes — the same 14 columns (id,
+  date, status, delivery status, Resend ID, from, to, cc, bcc,
+  reply-to, subject, content type, body and error), in any column
+  order as long as every name is present — with RFC 4180 quoting, an
+  optional UTF-8 BOM and CRLF or LF line endings. Files over 25 MB,
+  non-CSV uploads and wrong headers are refused before anything is
+  written, and `status` must be `sent` or `failed`. Rows are inserted
+  in batches of 50 through `DB.batch`, and a result page reports how
+  many rows were imported, skipped or invalid, with a reason for every
+  rejection. Nothing is re-sent — importing never calls Resend — and
+  no schema change or migration is needed.
 - Duplicate protection: a row is written whenever it differs in any
-  content field — `created_at`, `status`, `delivery_status`,
-  `from_address`, `to_addresses`, `cc_addresses`, `bcc_addresses`,
-  `reply_to`, `subject`, `content_type`, `body`, `error` or
-  `resend_id` — and only records identical in every one of those
-  fields are skipped. Identical rows are recognised against the
-  archive by `id` or Resend ID where the row has one, by full content
-  when it has neither, and against earlier rows of the same file. The
-  import is append-only: the `id` from the CSV is reused only when it
-  is still free, and a colliding row is stored under a fresh
-  autoincrement `id` — existing records are never modified or deleted.
+  content field — timestamp, status, delivery status, from, to, cc,
+  bcc, reply-to, subject, content type, body, error or Resend ID — and
+  only records identical in every one of those fields are skipped.
+  Identical rows are recognised against the archive by `id` or
+  Resend ID where the row has one, by full content when it has
+  neither, and against earlier rows of the same file. The import is
+  append-only: the `id` from the CSV is reused only when it is still
+  free, and a colliding row is stored under a fresh autoincrement `id`
+  — existing records are never modified or deleted.
 - One-click flow: the file input itself is visually hidden but stays
   keyboard-reachable (the button keeps the focus outline via
   `:focus-within`); clicking "Import CSV" opens the file picker
-  directly and picking a file submits the form at once, so importing
-  is one click end to end. The only JavaScript is a single inline
-  `onchange` attribute — the form itself is a plain multipart POST,
-  and the project still carries exactly its four inline scripts.
-- Nothing else changes: **`/sent`, `/sent/export`, search, sync and
-  sending render and behave exactly as in 0.10.0, and an import only
-  ever adds rows — nothing already in the archive is updated,
-  overwritten or deleted.**
+  directly and picking a file submits the form at once. The only
+  JavaScript is a single inline `onchange` attribute — the form itself
+  is a plain multipart POST, and the project still carries exactly its
+  four inline scripts.
 
 ## 0.10.0
 
@@ -55,8 +49,7 @@
   case-insensitively. `%` and `_` in the box are matched literally (bound
   parameters with `ESCAPE '\'`, so input can't change the query).
   Matching still returns at most 200 rows, with a match count and a
-  Clear link above the list. **With no search text and no status picked,
-  `/sent` renders exactly as before: same query, same page.**
+  Clear link above the list.
 
 ## 0.9.0
 
@@ -76,8 +69,6 @@
   `/sent` when present, and the CSV export gains `cc` and `bcc` as the
   final two columns — every existing column keeps its position, so
   anything that already parses the export keeps working.
-  **Calls that don't use the new fields behave exactly as in 0.8.0:
-  same payload, same stored row. Nothing was renamed or removed.**
 
 ## 0.8.0
 
