@@ -4,19 +4,28 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DOMAIN_RE = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const MAX_RECIPIENTS = 50;
 
+// Attachments (0.12.0): stored in D1 with the attempt, sent via Resend in
+// the same request. 2 MB is D1's hard per-row/BLOB cap, so a single file
+// stays well under it; Resend allows 40 MB per message after base64
+// encoding, and base64 adds a third, so the raw total stops at 25 MB.
+const MAX_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 1572864;                  // 1.5 MB per file
+const MAX_ATTACHMENTS_TOTAL = 26214400;                // 25 MB raw per message
+const DEFAULT_DB_CAP_BYTES = 10 * 1024 * 1024 * 1024;  // D1 cap, Workers Paid (Free: 500 MB)
+
+// Attachment summary per archived message, computed inside the /sent query:
+// the count for the list line, and id<US>filename<US>size triples (US =
+// char(31), a separator that cannot appear in real filenames' pairing) for
+// the expanded view.
+const ATTACHMENT_SUBSELECTS =
+  "(SELECT COUNT(*) FROM attachments a WHERE a.email_id = emails.id) AS attachment_count, " +
+  "(SELECT COALESCE(GROUP_CONCAT(a.id || char(31) || a.filename || char(31) || a.size), '') " +
+  "FROM attachments a WHERE a.email_id = emails.id) AS attachment_files ";
+
 // PASSWORD login sessions: 30-day signed cookies.
 const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
 const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_S * 1000;
 const LOGIN_FAIL_DELAY_MS = 500;
-
-// CSV import: the 14 columns /sent/export writes are the only header
-// /sent/import accepts, and uploads are capped before they are read.
-const IMPORT_COLUMNS = [
-  "id", "date", "status", "delivery_status", "resend_id", "from", "to",
-  "cc", "bcc", "reply_to", "subject", "content_type", "body", "error",
-];
-const IMPORT_MAX_MB = 25;
-const IMPORT_MAX_BYTES = IMPORT_MAX_MB * 1024 * 1024;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -42,38 +51,25 @@ function csvField(v) {
   return s;
 }
 
-// The other half of csvField: parses a CSV string into rows of fields.
-// Quoted fields may contain commas, doubled quotes and line breaks; both
-// CRLF and LF end a record; a UTF-8 BOM, if present, is stripped.
-function parseCsv(text) {
-  const s = String(text || "").replace(/^\uFEFF/, "");
-  const rows = [];
-  let row = [];
-  let field = "";
-  let inQuotes = false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (s[i + 1] === '"') { field += '"'; i++; }
-        else inQuotes = false;
-      } else {
-        field += c;
-      }
-    } else if (c === '"') {
-      inQuotes = true;
-    } else if (c === ",") {
-      row.push(field); field = "";
-    } else if (c === "\n" || c === "\r") {
-      if (c === "\r" && s[i + 1] === "\n") i++;
-      row.push(field); field = "";
-      rows.push(row); row = [];
-    } else {
-      field += c;
-    }
+// 1536 -> "1.5 KB", 1048576 -> "1.0 MB" — the units the storage meter and
+// the attachment lists are shown in.
+function humanBytes(n) {
+  let v = Number(n) || 0;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return (u === 0 ? String(v) : v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " " + units[u];
+}
+
+// Uint8Array -> base64, in chunks so large files don't blow the argument
+// limit of String.fromCharCode.
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
   }
-  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
-  return rows;
+  return btoa(bin);
 }
 
 // "a@b.com, c@d.com " -> ["a@b.com", "c@d.com"]; empty pieces dropped.
@@ -264,6 +260,22 @@ async function ensureSchema(env) {
       ")"
   ).run();
 
+  // Attachments (0.12.0): the bytes of every attached file, linked to the
+  // emails row of the attempt that carried it.
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS attachments (" +
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+      "email_id INTEGER NOT NULL, " +
+      "filename TEXT NOT NULL, " +
+      "content_type TEXT, " +
+      "size INTEGER NOT NULL, " +
+      "data BLOB NOT NULL" +
+      ")"
+  ).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_attachments_email ON attachments (email_id)"
+  ).run();
+
   schemaReady = true;
 }
 
@@ -283,6 +295,7 @@ async function getDomains(env) {
   } catch {}
   return [];
 }
+
 // --- Routing ------------------------------------------------------------
 export default {
   async fetch(request, env) {
@@ -388,7 +401,8 @@ export default {
       });
     }
 
-    // Sent-messages history
+    // Sent-messages history (with search, and the import-result banner
+    // parameters that POST /sent/import redirects back with)
     if (request.method === "GET" && url.pathname === "/sent") {
       const denied = await requirePage(request, env, url);
       if (denied) return denied;
@@ -402,65 +416,66 @@ export default {
 
       await ensureSchema(env);
 
-      // Search + filter. ?q= matches across the whole archive, ?status= is
-      // "sent" or "failed"; with neither present the query is exactly the
-      // old "newest 200". The pattern is always bound, never string-built,
-      // and % _ \ inside the search text are escaped so they stay literal
-      // (LIKE is case-insensitive for ASCII letters).
+      // Search: a free-text query (matched against the message columns with
+      // LIKE, user wildcards escaped) and/or a status filter. With neither
+      // parameter the query is exactly what older builds ran.
       const q = String(url.searchParams.get("q") || "").trim();
       const statusParam = String(url.searchParams.get("status") || "").trim();
-      const status =
-        statusParam === "sent" || statusParam === "failed" ? statusParam : "";
+      const status = statusParam === "sent" || statusParam === "failed" ? statusParam : "";
       const filtered = q !== "" || status !== "";
 
-      let where = "";
-      const binds = [];
-      if (filtered) {
-        const clauses = [];
-        if (q !== "") {
-          const pattern =
-            "%" + q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_") + "%";
-          const likeCols = [
-            "subject", "body", "to_addresses", "cc_addresses", "bcc_addresses",
-            "from_address", "reply_to", "resend_id", "error",
-          ];
-          clauses.push(
-            "(" + likeCols.map(function (c) { return c + " LIKE ? ESCAPE '\\'"; }).join(" OR ") + ")"
-          );
-          likeCols.forEach(function () { binds.push(pattern); });
-        }
-        if (status !== "") {
-          clauses.push("status = ?");
-          binds.push(status);
-        }
-        where = " WHERE " + clauses.join(" AND ");
-      }
+      // Import outcome, carried here by the redirect after POST
+      // /sent/import. Any of the count parameters present means: show it.
+      const countParam = function (name) {
+        const v = url.searchParams.get(name);
+        return v !== null && /^\d+$/.test(v) ? parseInt(v, 10) : null;
+      };
+      const notice = {
+        imported: countParam("imported"),
+        skipped: countParam("skipped"),
+        invalid: countParam("invalid"),
+        errs: String(url.searchParams.get("errs") || ""),
+      };
+      const showNotice =
+        notice.imported !== null || notice.skipped !== null || notice.invalid !== null;
 
+      // History, the domain list and (when searching) the total match
+      // count are independent — read them all at once.
       let rows = [];
       let domains = [];
       let totalMatches = null;
       try {
-        // History and the domain list are independent — read both at once
-        // (plus the match count when a filter is active).
-        const rowsSql = "SELECT * FROM emails" + where + " ORDER BY id DESC LIMIT 200";
-        const reads = [
-          binds.length
-            ? env.DB.prepare(rowsSql).bind(...binds).all()
-            : env.DB.prepare(rowsSql).all(),
-          getDomains(env),
-        ];
+        const reads = [getDomains(env)];
         if (filtered) {
-          const countSql = "SELECT COUNT(*) AS c FROM emails" + where;
+          const where = [];
+          const binds = [];
+          if (q !== "") {
+            const likeCols = [
+              "subject", "body", "to_addresses", "cc_addresses", "bcc_addresses",
+              "from_address", "reply_to", "resend_id", "error",
+            ];
+            const pattern =
+              "%" + q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_") + "%";
+            where.push("(" + likeCols.map(function (c) { return c + " LIKE ? ESCAPE '\\'"; }).join(" OR ") + ")");
+            binds.push(pattern);
+          }
+          if (status !== "") {
+            where.push("status = ?");
+            binds.push(status);
+          }
+          const whereSql = where.length ? " WHERE " + where.join(" AND ") : "";
           reads.push(
-            binds.length
-              ? env.DB.prepare(countSql).bind(...binds).first()
-              : env.DB.prepare(countSql).first()
+            env.DB.prepare("SELECT *, " + ATTACHMENT_SUBSELECTS + "FROM emails" + whereSql + " ORDER BY id DESC LIMIT 200")
+              .bind(...binds).all(),
+            env.DB.prepare("SELECT COUNT(*) AS c FROM emails" + whereSql).bind(...binds).first()
           );
+        } else {
+          reads.push(env.DB.prepare("SELECT *, " + ATTACHMENT_SUBSELECTS + "FROM emails ORDER BY id DESC LIMIT 200").all());
         }
         const settled = await Promise.all(reads);
-        rows = settled[0].results || [];
-        domains = settled[1];
-        totalMatches = filtered && settled[2] ? Number(settled[2].c || 0) : null;
+        domains = settled[0];
+        rows = (settled[1] && settled[1].results) || [];
+        if (filtered) totalMatches = settled[2] ? (settled[2].c || 0) : rows.length;
       } catch (err) {
         return new Response("Failed to read from D1: " + err.message, { status: 500 });
       }
@@ -471,6 +486,8 @@ export default {
           status: status,
           filtered: filtered,
           totalMatches: totalMatches,
+          notice: showNotice ? notice : null,
+          importError: String(url.searchParams.get("import_error") || ""),
         }),
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
@@ -523,11 +540,58 @@ export default {
       });
     }
 
-    // Import sent emails from a CSV in the exact format /sent/export
-    // writes. A plain HTML form POST (multipart): the token rides in the
-    // action URL, since a file upload cannot set the X-Auth-Token header.
+    // Import sent emails from a CSV file — exactly the format
+    // GET /sent/export writes. Appended to the archive with dedup.
     if (request.method === "POST" && url.pathname === "/sent/import") {
-      return handleImport(request, env, url, showLogout);
+      return handleImport(request, env, url);
+    }
+
+    // Download one stored attachment. Authed like the pages: the links on
+    // /sent carry ?token=, since a download link cannot send headers either.
+    if (request.method === "GET" && url.pathname.startsWith("/attachments/")) {
+      const denied = await requirePage(request, env, url);
+      if (denied) return denied;
+      if (!env.DB) {
+        return new Response("No D1 database is bound as DB.", {
+          status: 500,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+      await ensureSchema(env);
+      const m = /^\/attachments\/(\d+)$/.exec(url.pathname);
+      if (!m) return new Response("Not found", { status: 404 });
+
+      let row = null;
+      try {
+        row = await env.DB.prepare(
+          "SELECT filename, content_type, size, data FROM attachments WHERE id = ?"
+        ).bind(Number(m[1])).first();
+      } catch (err) {
+        return new Response("Failed to read from D1: " + err.message, { status: 500 });
+      }
+      if (!row) {
+        return new Response("Attachment not found", {
+          status: 404,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+
+      const raw = row.data;
+      const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw || 0);
+      const name = String(row.filename || "attachment");
+      const asciiName = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+      const safeType = /^[\w.\/+ -]{1,100}$/.test(String(row.content_type || ""))
+        ? String(row.content_type)
+        : "application/octet-stream";
+      return new Response(bytes, {
+        headers: {
+          "Content-Type": safeType,
+          "Content-Disposition":
+            'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + encodeURIComponent(name),
+          "Content-Length": String(bytes.byteLength),
+          "Cache-Control": "no-store",
+        },
+      });
     }
 
     // Usage dashboard — reads live from Resend (with D1 as fallback)
@@ -566,7 +630,11 @@ export default {
         domains = await getDomains(env);
       }
 
-      return new Response(renderUsagePage(stats, token, domains, showLogout), {
+      // The storage meter reads D1 directly; Resend being unreachable
+      // doesn't affect it, and no database means no card at all.
+      const storage = env.DB ? await getStorageInfo(env) : null;
+
+      return new Response(renderUsagePage(stats, token, domains, showLogout, storage), {
         headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
       });
     }
@@ -768,23 +836,71 @@ async function handleSend(request, env) {
     return json({ success: false, error: "Unauthorized." }, 401);
   }
 
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ success: false, error: "Request body must be valid JSON." }, 400);
+  // Two intake formats: the compose form posts multipart/form-data (file
+  // uploads can't ride in JSON), the API stays pure JSON — its attachments
+  // are {filename, content(base64), content_type?} objects. Both end up as
+  // the same `fields` map plus a `files` list of raw byte arrays.
+  const isMultipart = String(request.headers.get("content-type") || "")
+    .toLowerCase()
+    .includes("multipart/form-data");
+  const FIELD_KEYS = ["to", "cc", "bcc", "from_name", "from_local", "from_domain", "reply_to", "subject", "text", "html"];
+  let fields = {};
+  const files = [];
+  if (isMultipart) {
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return json({ success: false, error: "The upload could not be read." }, 400);
+    }
+    for (const key of FIELD_KEYS) {
+      fields[key] = String(form.get(key) || "");
+    }
+    for (const f of form.getAll("attachments")) {
+      if (typeof f === "string") continue;
+      if (!f.name && !f.size) continue; // nothing picked
+      files.push({
+        name: f.name || "attachment",
+        type: f.type || "",
+        bytes: new Uint8Array(await f.arrayBuffer()),
+      });
+    }
+  } else {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ success: false, error: "Request body must be valid JSON." }, 400);
+    }
+    body = body && typeof body === "object" ? body : {};
+    for (const key of FIELD_KEYS) {
+      fields[key] = String(body[key] || "");
+    }
+    const apiFiles = Array.isArray(body.attachments) ? body.attachments : [];
+    for (const a of apiFiles) {
+      if (!a || typeof a !== "object") continue;
+      let bytes = null;
+      try {
+        const bin = atob(String(a.content || "").replace(/\s+/g, ""));
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      } catch {
+        return json({ success: false, error: "attachments[].content must be valid base64." }, 400);
+      }
+      files.push({ name: String(a.filename || "attachment"), type: String(a.content_type || ""), bytes: bytes });
+    }
   }
 
-  const recipients = splitAddresses(body.to);
-  const cc = splitAddresses(body.cc);
-  const bcc = splitAddresses(body.bcc);
-  const subject = String(body.subject || "").trim();
-  const text = String(body.text || "").trim();
-  const html = String(body.html || "").trim();
-  const replyTo = String(body.reply_to || "").trim();
-  const fromName = String(body.from_name || "").trim().replace(/["<>]/g, "");
+  const recipients = splitAddresses(fields.to);
+  const cc = splitAddresses(fields.cc);
+  const bcc = splitAddresses(fields.bcc);
+  const subject = fields.subject.trim();
+  const text = fields.text.trim();
+  const html = fields.html.trim();
+  const replyTo = fields.reply_to.trim();
+  const fromName = fields.from_name.trim().replace(/["<>]/g, "");
   const fromLocal =
-    String(body.from_local || "noreply").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "") ||
+    (fields.from_local || "noreply").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "") ||
     "noreply";
 
   // Cheap validation first — nothing below touches the database until the
@@ -814,6 +930,32 @@ async function handleSend(request, env) {
     return json({ success: false, error: "Reply-To must be a valid email address." }, 400);
   }
 
+  // Attachment caps: enforced before anything is stored or sent. The
+  // per-file limit keeps every row under D1's 2 MB hard cap; the total
+  // keeps the base64 payload under Resend's 40 MB message limit.
+  if (files.length > MAX_ATTACHMENTS) {
+    return json(
+      { success: false, error: "Too many attachments (max " + MAX_ATTACHMENTS + " files)." },
+      400
+    );
+  }
+  let totalBytes = 0;
+  for (const f of files) {
+    if (f.bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+      return json(
+        { success: false, error: '"' + f.name + '" is ' + humanBytes(f.bytes.byteLength) + " — single files are capped at " + humanBytes(MAX_ATTACHMENT_BYTES) + "." },
+        400
+      );
+    }
+    totalBytes += f.bytes.byteLength;
+  }
+  if (totalBytes > MAX_ATTACHMENTS_TOTAL) {
+    return json(
+      { success: false, error: "Attachments total " + humanBytes(totalBytes) + " — the per-message cap is " + humanBytes(MAX_ATTACHMENTS_TOTAL) + "." },
+      400
+    );
+  }
+
   // The sending domain must be on the stored list; the first entry is the
   // default. One DB read, only for valid payloads.
   const allowedDomains = await getDomains(env);
@@ -823,7 +965,7 @@ async function handleSend(request, env) {
       400
     );
   }
-  const fromDomain = String(body.from_domain || allowedDomains[0]).trim().toLowerCase();
+  const fromDomain = String(fields.from_domain || allowedDomains[0]).trim().toLowerCase();
   if (!allowedDomains.includes(fromDomain)) {
     return json(
       { success: false, error: "from_domain must be one of: " + allowedDomains.join(", ") + "." },
@@ -841,6 +983,13 @@ async function handleSend(request, env) {
   if (replyTo) payload.reply_to = replyTo;
   if (cc.length) payload.cc = cc;
   if (bcc.length) payload.bcc = bcc;
+  if (files.length) {
+    payload.attachments = files.map(function (f) {
+      const a = { filename: f.name, content: bytesToBase64(f.bytes) };
+      if (f.type) a.content_type = f.type;
+      return a;
+    });
+  }
 
   await ensureSchema(env);
 
@@ -848,7 +997,15 @@ async function handleSend(request, env) {
   const storedBody = html || text;
   const contentType = html ? "html" : "text";
 
-  let res;
+  // One flow for every outcome: Resend is called, the attempt is archived,
+  // and the files that rode with it are stored next to it. Both archive
+  // writes are best-effort — a logging problem never breaks a delivered
+  // email; the response just carries a warning flag.
+  let res = null;
+  let resendId = null;
+  let status = "sent";
+  let errMsg = null;
+  let httpStatus = 200;
   try {
     res = await fetch(RESEND_ENDPOINT, {
       method: "POST",
@@ -859,32 +1016,60 @@ async function handleSend(request, env) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    await logEmail(env, null, from, recipients, cc, bcc, replyTo, subject,
-      storedBody, contentType, "failed", "Could not reach Resend: " + err.message);
-    return json({ success: false, error: "Could not reach Resend: " + err.message }, 502);
+    status = "failed";
+    errMsg = "Could not reach Resend: " + err.message;
+    httpStatus = 502;
   }
 
-  const data = await res.json().catch(() => ({}));
-
-  if (res.ok) {
-    const saved = await logEmail(env, data.id || null, from, recipients, cc, bcc, replyTo,
-      subject, storedBody, contentType, "sent", null);
-    return json({ success: true, id: data.id || null, saved: saved });
+  if (res) {
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      resendId = (data && data.id) || null;
+    } else {
+      status = "failed";
+      errMsg = (data && data.message) || "Resend returned HTTP " + res.status + ".";
+      httpStatus = 502;
+    }
   }
 
-  const errMsg = data.message || "Resend returned HTTP " + res.status + ".";
-  await logEmail(env, null, from, recipients, cc, bcc, replyTo, subject,
-    storedBody, contentType, "failed", errMsg);
-  return json({ success: false, error: errMsg }, 502);
+  const rowId = await logEmail(env, resendId, from, recipients, cc, bcc, replyTo,
+    subject, storedBody, contentType, status, errMsg);
+  const attachmentsSaved = files.length ? await storeAttachments(env, rowId, files) : true;
+
+  const out = { success: status === "sent", id: resendId, saved: rowId !== null };
+  if (files.length) out.attachments_saved = attachmentsSaved;
+  if (errMsg) out.error = errMsg;
+  return json(out, httpStatus);
 }
 
-// Writes the message into D1. Returns false (without throwing) if the
-// database is unavailable, so a logging problem never breaks the send.
-async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subject, body, contentType, status, error) {
-  if (!env.DB) return false;
+// Links the attachment files to the archived attempt. Returns false
+// (without throwing) when they could not be stored, mirroring logEmail.
+async function storeAttachments(env, rowId, files) {
+  if (!env.DB || rowId === null) return false;
   await ensureSchema(env);
   try {
-    await env.DB.prepare(
+    const statements = files.map(function (f) {
+      return env.DB.prepare(
+        "INSERT INTO attachments (email_id, filename, content_type, size, data) VALUES (?, ?, ?, ?, ?)"
+      ).bind(rowId, f.name, f.type || null, f.bytes.byteLength, f.bytes);
+    });
+    for (let i = 0; i < statements.length; i += 50) {
+      await env.DB.batch(statements.slice(i, i + 50));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Writes the message into D1 and returns the new row's id, so the
+// attachments can be linked to it. Returns null (without throwing) if the
+// database is unavailable, so a logging problem never breaks the send.
+async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subject, body, contentType, status, error) {
+  if (!env.DB) return null;
+  await ensureSchema(env);
+  try {
+    const result = await env.DB.prepare(
       "INSERT INTO emails (resend_id, from_address, to_addresses, cc_addresses, bcc_addresses, reply_to, subject, body, content_type, status, error) " +
       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -893,117 +1078,142 @@ async function logEmail(env, resendId, from, recipients, cc, bcc, replyTo, subje
         bcc && bcc.length ? bcc.join(", ") : null,
         replyTo || null, subject, body, contentType, status, error)
       .run();
-    return true;
+    return result && result.meta && result.meta.last_row_id ? result.meta.last_row_id : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 // --- CSV import (POST /sent/import) --------------------------------------
-// Accepts a file in the exact format /sent/export writes and stores every
-// row that differs from what is already archived: only records identical
-// in every content field are skipped (matched by id, by Resend ID, or by
-// full content for rows without one). Identical rows inside the file
-// itself collapse to the first copy. Rows are never updated, nothing is
-// overwritten, nothing is re-sent and Resend is never called.
-async function handleImport(request, env, url, showLogout) {
-  // POST auth like the other endpoints, plus the ?token= from the form's
-  // action URL — a multipart upload cannot set the X-Auth-Token header.
-  const token = url.searchParams.get("token") || "";
-  const authed =
-    (await isAuthorized(request, env)) ||
-    (!!env.AUTH_TOKEN &&
-      (await constantTimeEqual(token, env.AUTH_TOKEN)));
-  if (!authed) {
-    return new Response("Unauthorized", {
-      status: 401,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
-  }
-  if (!env.DB) {
-    return new Response("No D1 database is bound as DB.", {
-      status: 500,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
-  }
+// Accepts exactly the format GET /sent/export writes: the same 14 columns
+// (the header must name all of them, in any order), RFC 4180 quoting, UTF-8
+// with or without a BOM, CRLF or LF. The import is append-only with
+// duplicate protection: a row is written whenever it differs in any content
+// field — timestamp, status, delivery status, from, to, cc, bcc, reply-to,
+// subject, content type, body, error or Resend ID — and only records
+// identical in every one of those fields are skipped. Identical rows are
+// recognised against the archive by id or resend_id, by full content when
+// the row carries no resend_id, and against earlier rows of the same file.
+// The id from the CSV is reused only when it is still free; everything else
+// is stored under a fresh autoincrement id, so nothing already in the
+// archive is ever modified or deleted. Nothing is re-sent through Resend
+// and no schema change is involved.
 
-  await ensureSchema(env);
+const IMPORT_COLUMNS = [
+  "id", "date", "status", "delivery_status", "resend_id", "from", "to",
+  "cc", "bcc", "reply_to", "subject", "content_type", "body", "error",
+];
+const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 
-  const renderResult = async function (r, status) {
-    return new Response(
-      renderImportResult(r, token, await getDomains(env), showLogout),
-      {
-        status: status || 200,
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+const IMPORT_INSERT_SQL =
+  "INSERT INTO emails (id, created_at, status, delivery_status, resend_id, from_address, " +
+  "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, content_type, body, error) " +
+  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const IMPORT_INSERT_AUTO_SQL =
+  "INSERT INTO emails (created_at, status, delivery_status, resend_id, from_address, " +
+  "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, content_type, body, error) " +
+  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+// null/undefined and "" are the same thing once a value leaves the database
+// or the CSV, so every comparison normalizes both sides through this.
+function normValue(v) {
+  return v === null || v === undefined ? "" : String(v);
+}
+
+// Parses a CSV string into rows of string fields. RFC 4180: a field may be
+// double-quoted and then contain commas, doubled quotes and newlines;
+// records end with CRLF, LF or a lone CR; the UTF-8 BOM is stripped.
+function parseCsv(text) {
+  const s = String(text || "").replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += ch;
       }
-    );
-  };
-  const refuse = function (message, status) {
-    return renderResult({ error: message }, status);
-  };
-
-  // Cheap size gate on the declared upload size, before the body is read.
-  const declared = parseInt(request.headers.get("content-length") || "0", 10);
-  if (declared > IMPORT_MAX_BYTES + 4096) {
-    return refuse("That upload is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(field); field = "";
+    } else if (ch === "\r" || ch === "\n") {
+      row.push(field); field = "";
+      rows.push(row); row = [];
+      if (ch === "\r" && s[i + 1] === "\n") i++;
+    } else {
+      field += ch;
+    }
   }
+  if (field !== "" || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
 
-  let form = null;
-  try {
-    form = await request.formData();
-  } catch {}
-  const file = form ? form.get("csv") : null;
-  if (!file || typeof file === "string") {
-    return refuse("No file was uploaded — choose a CSV exported from the Sent page.", 400);
-  }
-  if (file.size > IMPORT_MAX_BYTES) {
-    return refuse("That file is too large (over " + IMPORT_MAX_MB + " MB) — nothing was imported.", 400);
-  }
+// Turns parsed CSV rows into validated records. Returns { error } for
+// structural problems that refuse the whole file, or { records, reasons,
+// invalid } — records ready to merge, reasons explaining every rejected
+// row by row number.
+function parseImportCsv(text) {
+  const rows = parseCsv(text);
+  if (rows.length === 0) return { error: "That file is empty." };
 
-  const table = parseCsv(await file.text());
-  const records = table.filter(function (r) {
-    return r.length > 1 || (r.length === 1 && r[0].trim() !== "");
-  });
-  if (records.length < 2) {
-    return refuse("That file has no data rows — nothing was imported.", 400);
-  }
-
-  // The header must name the same 14 columns the export writes, in any
-  // order; anything else is refused before a single row is written.
-  const header = records[0].map(function (h) { return h.trim().toLowerCase(); });
-  const missing = IMPORT_COLUMNS.filter(function (name) { return header.indexOf(name) === -1; });
-  if (missing.length > 0) {
-    return refuse(
-      "The header row does not match the export format — missing column(s): " +
-        missing.join(", ") + ".",
-      400
-    );
+  const header = rows[0].map(function (c) { return c.trim().toLowerCase(); });
+  if (header.length !== IMPORT_COLUMNS.length) {
+    return {
+      error: "The header row must name exactly the " + IMPORT_COLUMNS.length +
+        " columns of an Outbox export (id, date, status, ...).",
+    };
   }
   const col = {};
-  IMPORT_COLUMNS.forEach(function (name) { col[name] = header.indexOf(name); });
+  for (let c = 0; c < header.length; c++) col[header[c]] = c;
+  for (const name of IMPORT_COLUMNS) {
+    if (col[name] === undefined) {
+      return {
+        error: 'The header row is missing the "' + name + '" column — this does not look like an Outbox export.',
+      };
+    }
+  }
 
-  // Row-by-row validation: status is the one hard rule. Everything else is
-  // stored as it arrives.
-  const candidates = [];
-  const invalid = [];
-  for (let i = 1; i < records.length; i++) {
-    const rec = records[i];
-    const cell = function (name) {
-      const v = rec[col[name]];
-      return v === undefined ? "" : String(v);
-    };
-    if (rec.length < header.length) {
-      invalid.push("record " + (i + 1) + ": fewer fields than the header");
+  const records = [];
+  const reasons = [];
+  let invalid = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const rowNo = r + 1; // line number as a spreadsheet shows it
+    if (cells.length === 1 && cells[0].trim() === "") {
+      invalid++;
+      reasons.push("Row " + rowNo + ": empty row.");
+      continue;
+    }
+    if (cells.length !== IMPORT_COLUMNS.length) {
+      invalid++;
+      reasons.push("Row " + rowNo + ": expected " + IMPORT_COLUMNS.length + " columns, found " + cells.length + ".");
+      continue;
+    }
+    const cell = function (name) { return normValue(cells[col[name]]); };
+    const id = cell("id").trim();
+    if (id !== "" && !/^\d+$/.test(id)) {
+      invalid++;
+      reasons.push("Row " + rowNo + ": id must be empty or a number.");
       continue;
     }
     const status = cell("status").trim().toLowerCase();
     if (status !== "sent" && status !== "failed") {
-      invalid.push("record " + (i + 1) + ": status must be sent or failed");
+      invalid++;
+      reasons.push('Row ' + rowNo + ': status must be "sent" or "failed".');
       continue;
     }
-    const idRaw = cell("id").trim();
-    candidates.push({
-      id: /^[0-9]+$/.test(idRaw) ? parseInt(idRaw, 10) : null,
+    records.push({
+      rowNo: rowNo,
+      id: id,
+      created_at: cell("date").trim(),
+      status: status,
+      delivery_status: cell("delivery_status").trim(),
       resend_id: cell("resend_id").trim(),
       from_address: cell("from"),
       to_addresses: cell("to"),
@@ -1011,175 +1221,225 @@ async function handleImport(request, env, url, showLogout) {
       bcc_addresses: cell("bcc"),
       reply_to: cell("reply_to"),
       subject: cell("subject"),
+      content_type: cell("content_type").trim(),
       body: cell("body"),
-      content_type: cell("content_type").trim().toLowerCase(),
-      status: status,
       error: cell("error"),
-      delivery_status: cell("delivery_status").trim().toLowerCase(),
-      created_at: cell("date").trim(),
     });
   }
+  return { records: records, reasons: reasons, invalid: invalid };
+}
 
-  // Duplicate check, pass 1 — bulk and cheap, chunked like reconciliation:
-  // pull the full archived content of every row this file could collide
-  // with, by id and by Resend ID, so identical records can be recognized
-  // field by field instead of by identifier alone.
-  const existingIds = new Set();
-  const byId = new Map();
-  const byRid = new Map();
+// The fingerprint of a CSV record: every content field in a fixed order
+// (everything except the surrogate id). Stored rows hash through
+// rowFingerprint with NULLs normalized to "", so a missing value compares
+// equal no matter which side it comes from.
+function importTupleKey(c) {
+  return JSON.stringify([
+    c.created_at, c.status, c.delivery_status, c.from_address, c.to_addresses,
+    c.cc_addresses, c.bcc_addresses, c.reply_to, c.subject, c.content_type,
+    c.body, c.error, c.resend_id,
+  ]);
+}
+
+function rowFingerprint(row) {
+  return JSON.stringify([
+    normValue(row.created_at), normValue(row.status), normValue(row.delivery_status),
+    normValue(row.from_address), normValue(row.to_addresses), normValue(row.cc_addresses),
+    normValue(row.bcc_addresses), normValue(row.reply_to), normValue(row.subject),
+    normValue(row.content_type), normValue(row.body), normValue(row.error),
+    normValue(row.resend_id),
+  ]);
+}
+
+// After the import the browser is sent back to /sent, which renders the
+// outcome as a banner. The token rides along so token-auth setups can
+// still open the page.
+function importRedirect(url, result, error) {
+  const params = new URLSearchParams();
+  const token = url.searchParams.get("token") || "";
+  if (token) params.set("token", token);
+  if (error) {
+    params.set("import_error", String(error).slice(0, 300));
+  } else {
+    params.set("imported", String(result.imported));
+    params.set("skipped", String(result.skipped));
+    params.set("invalid", String(result.invalid));
+    if (result.reasons && result.reasons.length) {
+      let errs = result.reasons.slice(0, 3).join(" | ");
+      if (result.reasons.length > 3 || errs.length > 380) errs = errs.slice(0, 380) + "...";
+      params.set("errs", errs);
+    }
+  }
+  const qs = params.toString();
+  return redirect("/sent" + (qs ? "?" + qs : ""), 303);
+}
+
+// The import endpoint. A multipart upload cannot send the X-Auth-Token
+// header, so it authenticates like a page does: the PASSWORD session
+// cookie, or the ?token= carried in the form's action URL.
+async function handleImport(request, env, url) {
+  if (!(await pageAuthOk(request, env, url))) {
+    if (env.PASSWORD) return redirect("/login?next=" + encodeURIComponent("/sent"));
+    return new Response("Unauthorized", { status: 401 });
+  }
+  if (!env.DB) return importRedirect(url, null, "No D1 database is bound as DB.");
+  await ensureSchema(env);
+
+  let form;
   try {
-    const idVals = [];
-    const ridVals = [];
-    for (const c of candidates) {
-      if (c.id !== null && idVals.indexOf(c.id) === -1) idVals.push(c.id);
-      if (c.resend_id !== "" && ridVals.indexOf(c.resend_id) === -1) ridVals.push(c.resend_id);
-    }
-    const fingerprintCols =
-      "id, resend_id, created_at, status, delivery_status, from_address, " +
-      "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, " +
-      "content_type, body, error";
-    for (let i = 0; i < idVals.length; i += 50) {
-      const chunk = idVals.slice(i, i + 50);
-      const r = await env.DB.prepare(
-        "SELECT " + fingerprintCols + " FROM emails WHERE id IN (" +
-        chunk.map(function () { return "?"; }).join(",") + ")"
-      ).bind(...chunk).all();
-      for (const row of r.results || []) {
-        existingIds.add(row.id);
-        byId.set(row.id, rowFingerprint(row));
-      }
-    }
-    for (let i = 0; i < ridVals.length; i += 50) {
-      const chunk = ridVals.slice(i, i + 50);
-      const r = await env.DB.prepare(
-        "SELECT " + fingerprintCols + " FROM emails WHERE resend_id IN (" +
-        chunk.map(function () { return "?"; }).join(",") + ")"
-      ).bind(...chunk).all();
-      for (const row of r.results || []) byRid.set(row.resend_id, rowFingerprint(row));
-    }
-  } catch (err) {
-    return refuse("Could not read from D1: " + err.message, 500);
+    form = await request.formData();
+  } catch {
+    return importRedirect(url, null, "The upload could not be read.");
+  }
+  const file = form.get("csv");
+  if (!file || typeof file === "string") {
+    return importRedirect(url, null, "Choose a CSV file first.");
+  }
+  if (file.size > MAX_IMPORT_BYTES) {
+    return importRedirect(url, null, "That file is larger than 25 MB — split it first.");
   }
 
-  // Pass 2 — decide. A row is stored whenever it differs from the archive
-  // in any content field; only a record identical in every field is
-  // skipped, whether it matches an archived row by id, by Resend ID, or —
-  // for rows without a Resend ID — by full content. The seen-set carries
-  // the same rule across the rows of this file, so a repeat inside the
-  // file collapses to the first copy.
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    return importRedirect(url, null, "The file could not be read as text.");
+  }
+
+  const parsed = parseImportCsv(text);
+  if (parsed.error) return importRedirect(url, null, parsed.error);
+
+  const recs = parsed.records;
+  const reasons = parsed.reasons.slice();
+  let invalid = parsed.invalid;
+  let imported = 0;
+  let skipped = 0;
+
+  // Pass 1 — preload the archive rows this file can be matched against:
+  // every stored id and resend_id the file mentions, fetched in chunks of
+  // 50 with their content fingerprints.
+  const idNums = [];
+  const seenIds = new Set();
+  const resendIds = [];
+  const seenResends = new Set();
+  const existingIds = new Set();
+  for (const rec of recs) {
+    if (rec.id !== "" && !seenIds.has(rec.id)) { seenIds.add(rec.id); idNums.push(Number(rec.id)); }
+    if (rec.resend_id !== "" && !seenResends.has(rec.resend_id)) {
+      seenResends.add(rec.resend_id);
+      resendIds.push(rec.resend_id);
+    }
+  }
+
+  const byId = new Map();
+  const byRid = new Map();
+  const FP_COLS =
+    "id, resend_id, created_at, status, delivery_status, from_address, " +
+    "to_addresses, cc_addresses, bcc_addresses, reply_to, subject, " +
+    "content_type, body, error";
+  try {
+    for (let i = 0; i < idNums.length; i += 50) {
+      const chunk = idNums.slice(i, i + 50);
+      const marks = chunk.map(function () { return "?"; }).join(",");
+      const found = await env.DB.prepare(
+        "SELECT " + FP_COLS + " FROM emails WHERE id IN (" + marks + ")"
+      ).bind(...chunk).all();
+      for (const row of found.results || []) {
+        existingIds.add(Number(row.id));
+        byId.set(Number(row.id), rowFingerprint(row));
+      }
+    }
+    for (let i = 0; i < resendIds.length; i += 50) {
+      const chunk = resendIds.slice(i, i + 50);
+      const marks = chunk.map(function () { return "?"; }).join(",");
+      const found = await env.DB.prepare(
+        "SELECT " + FP_COLS + " FROM emails WHERE resend_id IN (" + marks + ")"
+      ).bind(...chunk).all();
+      for (const row of found.results || []) {
+        if (!byRid.has(row.resend_id)) byRid.set(row.resend_id, rowFingerprint(row));
+      }
+    }
+  } catch (err) {
+    return importRedirect(url, null, "Could not read the database: " + err.message);
+  }
+
+  // Pass 2 — decide, don't write. The first occurrence of a record wins:
+  // identical rows are skipped, rows that differ in any content field are
+  // queued as new inserts.
+  const nowSql = new Date().toISOString().slice(0, 19).replace("T", " ");
   const seenContent = new Set();
   const toInsert = [];
-  let skipped = 0;
-  for (const c of candidates) {
+
+  for (const c of recs) {
     const key = importTupleKey(c);
     if (
       seenContent.has(key) ||
-      (c.id !== null && byId.get(c.id) === key) ||
+      (c.id !== "" && byId.get(Number(c.id)) === key) ||
       (c.resend_id !== "" && byRid.get(c.resend_id) === key)
     ) {
       skipped++;
       continue;
     }
     if (c.resend_id === "") {
-      // No Resend ID to lean on — compare every archived field against the
-      // archive. SQLite evaluates the cheap columns first, so bodies are
-      // only read for rows that already match on everything else.
+      // No Resend ID to match on — identical content in the archive is the
+      // one duplicate shape left to catch. NULL and "" normalize equal.
       try {
         const dup = await env.DB.prepare(
-          "SELECT id FROM emails WHERE " +
-            "IFNULL(created_at,'') = ? AND status = ? AND IFNULL(delivery_status,'') = ? " +
-            "AND IFNULL(from_address,'') = ? AND IFNULL(to_addresses,'') = ? " +
-            "AND IFNULL(cc_addresses,'') = ? AND IFNULL(bcc_addresses,'') = ? " +
-            "AND IFNULL(reply_to,'') = ? AND subject = ? AND IFNULL(content_type,'') = ? " +
-            "AND IFNULL(body,'') = ? AND IFNULL(error,'') = ? LIMIT 1"
-        )
-          .bind(
-            c.created_at, c.status, c.delivery_status,
-            c.from_address, c.to_addresses, c.cc_addresses,
-            c.bcc_addresses, c.reply_to, c.subject,
-            c.content_type, c.body, c.error
-          )
-          .first();
-        if (dup) { skipped++; seenContent.add(key); continue; }
+          "SELECT 1 FROM emails WHERE IFNULL(created_at,'') = ? AND status = ? " +
+          "AND IFNULL(delivery_status,'') = ? AND from_address = ? AND to_addresses = ? " +
+          "AND IFNULL(cc_addresses,'') = ? AND IFNULL(bcc_addresses,'') = ? " +
+          "AND IFNULL(reply_to,'') = ? AND subject = ? AND IFNULL(content_type,'') = ? " +
+          "AND body = ? AND IFNULL(error,'') = ? LIMIT 1"
+        ).bind(
+          c.created_at, c.status, c.delivery_status, c.from_address, c.to_addresses,
+          c.cc_addresses, c.bcc_addresses, c.reply_to, c.subject, c.content_type,
+          c.body, c.error
+        ).first();
+        if (dup) { skipped++; continue; }
       } catch (err) {
-        return refuse("Could not read from D1: " + err.message, 500);
+        return importRedirect(url, null, "Could not read the database: " + err.message);
       }
     }
     seenContent.add(key);
     toInsert.push(c);
+    imported++;
   }
 
-  // Pass 3 — store, in batches of 50. The CSV id is honoured when it is
-  // free; when it is already taken the row still goes in, just under a
-  // fresh autoincrement id — the archive is append-only, nothing is
-  // overwritten. On a failure the rows already committed stay; the report
-  // says exactly how far it got, and a re-run skips everything identical
-  // that made it in.
-  let stored = 0;
-  try {
-    for (let i = 0; i < toInsert.length; i += 50) {
-      const batch = [];
-      for (const c of toInsert.slice(i, i + 50)) {
-        const cols = [];
-        const vals = [];
-        if (c.id !== null && !existingIds.has(c.id)) { cols.push("id"); vals.push(c.id); }
-        cols.push("resend_id", "from_address", "to_addresses", "cc_addresses",
-          "bcc_addresses", "reply_to", "subject", "body", "content_type",
-          "status", "error", "delivery_status");
-        vals.push(
-          c.resend_id || null, c.from_address, c.to_addresses,
-          c.cc_addresses || null, c.bcc_addresses || null, c.reply_to || null,
-          c.subject, c.body, c.content_type || null, c.status,
-          c.error || null, c.delivery_status || null
-        );
-        if (c.created_at) { cols.push("created_at"); vals.push(c.created_at); }
-        batch.push(
-          env.DB.prepare(
-            "INSERT INTO emails (" + cols.join(", ") + ") VALUES (" +
-            cols.map(function () { return "?"; }).join(", ") + ")"
-          ).bind(...vals)
-        );
+  // Pass 3 — write in batches of 50. The CSV id is honored only when it is
+  // still free; a colliding row gets a fresh autoincrement id, so nothing
+  // already in the archive is modified or deleted.
+  if (toInsert.length) {
+    try {
+      const statements = toInsert.map(function (c) {
+        const binds = [
+          c.created_at !== "" ? c.created_at : nowSql,
+          c.status,
+          c.delivery_status === "" ? null : c.delivery_status,
+          c.resend_id === "" ? null : c.resend_id,
+          c.from_address,
+          c.to_addresses,
+          c.cc_addresses === "" ? null : c.cc_addresses,
+          c.bcc_addresses === "" ? null : c.bcc_addresses,
+          c.reply_to === "" ? null : c.reply_to,
+          c.subject,
+          c.content_type === "" ? null : c.content_type,
+          c.body,
+          c.error === "" ? null : c.error,
+        ];
+        if (c.id !== "" && !existingIds.has(Number(c.id))) {
+          return env.DB.prepare(IMPORT_INSERT_SQL).bind(Number(c.id), ...binds);
+        }
+        return env.DB.prepare(IMPORT_INSERT_AUTO_SQL).bind(...binds);
+      });
+      for (let i = 0; i < statements.length; i += 50) {
+        await env.DB.batch(statements.slice(i, i + 50));
       }
-      await env.DB.batch(batch);
-      stored += batch.length;
+    } catch (err) {
+      return importRedirect(url, null, "Could not write to the database: " + err.message);
     }
-  } catch (err) {
-    return renderResult({
-      error:
-        "The import stopped partway: " + err.message + " — " + stored + " of " +
-        toInsert.length + " rows were written (only the non-duplicates). Fix the file and import it again; what is already in the archive is skipped automatically.",
-    }, 500);
   }
 
-  return renderResult({
-    imported: stored,
-    skipped: skipped,
-    invalid: invalid,
-  });
-}
-
-// Content fingerprint for the import's duplicate check: every archived
-// field except the row id, including the Resend ID (empty when absent).
-// Two records count as the same email when all of these match.
-function importTupleKey(c) {
-  return JSON.stringify([
-    c.created_at, c.status, c.delivery_status,
-    c.from_address, c.to_addresses, c.cc_addresses,
-    c.bcc_addresses, c.reply_to, c.subject,
-    c.content_type, c.body, c.error, c.resend_id,
-  ]);
-}
-
-// The same fingerprint for a row already in the archive, so an imported
-// record can be compared field by field against what is stored. NULL
-// columns normalize to "" to match how the CSV parser reads them.
-function rowFingerprint(r) {
-  return JSON.stringify([
-    r.created_at || "", r.status || "", r.delivery_status || "",
-    r.from_address || "", r.to_addresses || "", r.cc_addresses || "",
-    r.bcc_addresses || "", r.reply_to || "", r.subject || "",
-    r.content_type || "", r.body || "", r.error || "", r.resend_id || "",
-  ]);
+  return importRedirect(url, { imported: imported, skipped: skipped, invalid: invalid, reasons: reasons });
 }
 
 // --- Live stats straight from Resend ------------------------------------
@@ -1421,7 +1681,7 @@ async function getD1Stats(env) {
     }
   } catch {}
   const topRecipients = Object.keys(recipCounts)
-    .map(function (k) { return [k, recip[k]]; })
+    .map(function (k) { return [k, recipCounts[k]]; })
     .sort(function (a, b) { return b[1] - a[1]; })
     .slice(0, 5);
 
@@ -1505,6 +1765,52 @@ async function syncDeliveryStatuses(env) {
   }
   return { checked, byStatus };
 }
+
+// --- Database storage (the /usage meter) ---------------------------------
+// D1 does not expose a database's on-disk size to the Worker, so "used" is
+// computed from the data itself: attachment bytes plus an estimate of the
+// message rows (column lengths plus a per-row overhead allowance). When D1
+// answers the page_count/page_size pragmas — not in its supported PRAGMA
+// list, so this can quietly fail — the real file size is shown instead.
+async function getStorageInfo(env) {
+  const out = { files: 0, attachmentBytes: 0, textBytes: 0, dbBytes: null, capBytes: dbCapBytes(env) };
+  try {
+    const a = await env.DB.prepare(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS b FROM attachments"
+    ).first();
+    out.files = (a && a.n) || 0;
+    out.attachmentBytes = (a && a.b) || 0;
+  } catch {}
+  try {
+    const t = await env.DB.prepare(
+      "SELECT COALESCE(SUM(" +
+      "LENGTH(COALESCE(body, '')) + LENGTH(COALESCE(subject, '')) + " +
+      "LENGTH(COALESCE(to_addresses, '')) + LENGTH(COALESCE(cc_addresses, '')) + " +
+      "LENGTH(COALESCE(bcc_addresses, '')) + LENGTH(COALESCE(from_address, '')) + " +
+      "LENGTH(COALESCE(reply_to, '')) + LENGTH(COALESCE(resend_id, '')) + " +
+      "LENGTH(COALESCE(delivery_status, '')) + LENGTH(COALESCE(content_type, '')) + " +
+      "LENGTH(COALESCE(error, '')) + 96), 0) AS b FROM emails"
+    ).first();
+    out.textBytes = (t && t.b) || 0;
+  } catch {}
+  try {
+    const pc = await env.DB.prepare("PRAGMA page_count").first();
+    const ps = await env.DB.prepare("PRAGMA page_size").first();
+    const pageCount = pc ? Number(pc.page_count !== undefined ? pc.page_count : Object.values(pc)[0]) : 0;
+    const pageSize = ps ? Number(ps.page_size !== undefined ? ps.page_size : Object.values(ps)[0]) : 0;
+    if (pageCount > 0 && pageSize > 0) out.dbBytes = pageCount * pageSize;
+  } catch {}
+  return out;
+}
+
+// The cap the meter divides by: a DB_CAP_MB var can match the account's
+// plan (500 MB on the free plan); the default is D1's per-database cap on
+// Workers Paid.
+function dbCapBytes(env) {
+  const mb = Number(env && env.DB_CAP_MB);
+  return mb > 0 ? mb * 1024 * 1024 : DEFAULT_DB_CAP_BYTES;
+}
+
 // --- Pages: shared dashboard shell --------------------------------------
 // All pages render through renderShell(): sidebar navigation on desktop
 // that collapses into a sticky top bar with tab navigation below 860px,
@@ -2022,6 +2328,9 @@ function renderPage(domains, token, showLogout) {
     </div>
     <iframe id="preview-frame" class="preview-frame" sandbox="" hidden></iframe>
     <pre id="preview-text" class="preview-text" hidden></pre>
+    <label for="attachments">Attachments</label>
+    <input id="attachments" type="file" multiple>
+    <div class="hint" id="attachment-hint">Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.</div>
     <button id="submit-btn" type="submit" class="btn block">Send email</button>
   </form>
   <div class="status" id="status"></div>
@@ -2041,7 +2350,7 @@ function renderPage(domains, token, showLogout) {
     margin-top: 12px;
   }
   /* Rendered previews stay white in both themes: that is how the
-     recipient sees the message. */
+  recipient sees the message. */
   .preview-frame { height: 260px; display: block; background: #ffffff; }
   .preview-text {
     min-height: 150px;
@@ -2054,6 +2363,21 @@ function renderPage(domains, token, showLogout) {
     background: #ffffff;
   }
   #submit-btn { margin-top: 22px; }
+  #attachments { padding: 8px 10px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  #attachments::file-selector-button {
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+    background: var(--ghost-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    padding: 7px 12px;
+    margin: 0 10px 0 0;
+    cursor: pointer;
+  }
+  #attachments::file-selector-button:hover { background: var(--ghost-hover); }
+  .hint.err { color: var(--err); }
 `;
 
   const script = `<script>
@@ -2073,6 +2397,47 @@ function renderPage(domains, token, showLogout) {
   var previewFrame = document.getElementById("preview-frame");
   var previewText = document.getElementById("preview-text");
   var previewing = false;
+  var attInput = document.getElementById("attachments");
+  var attHint = document.getElementById("attachment-hint");
+  var ATT_MAX_FILES = 10;
+  var ATT_MAX_FILE = 1572864;  /* 1.5 MB — kept in sync with the server */
+  var ATT_MAX_TOTAL = 26214400; /* 25 MB */
+  var attProblem = "";
+
+  function fmtSize(n) {
+    if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return Math.round(n / 1024) + " KB";
+    return n + " B";
+  }
+
+  function checkAttachments() {
+    attProblem = "";
+    var files = attInput.files;
+    var total = 0;
+    var names = [];
+    for (var i = 0; i < files.length; i++) {
+      total += files[i].size;
+      names.push(files[i].name + " (" + fmtSize(files[i].size) + ")");
+      if (files[i].size > ATT_MAX_FILE) {
+        attProblem += (attProblem ? "; " : "") + files[i].name + " is over " + fmtSize(ATT_MAX_FILE);
+      }
+    }
+    if (files.length > ATT_MAX_FILES) {
+      attProblem += (attProblem ? "; " : "") + "at most " + ATT_MAX_FILES + " files";
+    }
+    if (total > ATT_MAX_TOTAL) {
+      attProblem += (attProblem ? "; " : "") + "total over " + fmtSize(ATT_MAX_TOTAL);
+    }
+    if (!files.length) {
+      attHint.textContent = "Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.";
+      attHint.className = "hint";
+      return;
+    }
+    attHint.textContent = names.join(", ") + (attProblem ? " — " + attProblem : "");
+    attHint.className = attProblem ? "hint err" : "hint";
+  }
+  attInput.addEventListener("change", checkAttachments);
 
   function updatePreview() {
     var local = (localInput.value || "").trim().toLowerCase() || "noreply";
@@ -2121,40 +2486,47 @@ function renderPage(domains, token, showLogout) {
 
   form.addEventListener("submit", function (e) {
     e.preventDefault();
+    checkAttachments();
+    if (attProblem) {
+      statusBox.textContent = "Error: " + attProblem;
+      statusBox.className = "status error";
+      return;
+    }
     btn.disabled = true;
     btn.textContent = "Sending...";
     statusBox.textContent = "";
     statusBox.className = "status";
 
-    var payload = {
-      to: document.getElementById("to").value,
-      cc: document.getElementById("cc").value,
-      bcc: document.getElementById("bcc").value,
-      from_name: document.getElementById("from_name").value,
-      from_local: localInput.value,
-      reply_to: document.getElementById("reply_to").value,
-      subject: document.getElementById("subject").value
-    };
-    if (domainSel) payload.from_domain = domainSel.value;
-    if (htmlBox.checked) {
-      payload.html = messageBox.value;
-    } else {
-      payload.text = messageBox.value;
+    var fd = new FormData();
+    fd.append("to", document.getElementById("to").value);
+    fd.append("cc", document.getElementById("cc").value);
+    fd.append("bcc", document.getElementById("bcc").value);
+    fd.append("from_name", document.getElementById("from_name").value);
+    fd.append("from_local", localInput.value);
+    fd.append("reply_to", document.getElementById("reply_to").value);
+    fd.append("subject", document.getElementById("subject").value);
+    if (domainSel) fd.append("from_domain", domainSel.value);
+    fd.append(htmlBox.checked ? "html" : "text", messageBox.value);
+    for (var i = 0; i < attInput.files.length; i++) {
+      fd.append("attachments", attInput.files[i]);
     }
 
     fetch("/send", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN },
-      body: JSON.stringify(payload)
+      headers: { "X-Auth-Token": TOKEN },
+      body: fd
     })
       .then(function (res) { return res.json(); })
       .then(function (data) {
         if (data.success) {
           var msg = "Email sent!" + (data.id ? " (Resend ID: " + data.id + ")" : "");
           if (data.saved === false) msg += " — warning: could not save to history.";
+          if (data.attachments_saved === false) msg += " — warning: attachments could not be saved to history.";
           statusBox.textContent = msg;
           statusBox.className = "status success";
           form.reset();
+          attInput.value = "";
+          checkAttachments();
           updatePreview();
           msgLabel.textContent = "Message";
           exitPreview();
@@ -2329,41 +2701,38 @@ function renderDomainsPage(domains, token, showLogout) {
   });
 }
 
-function renderSentPage(rows, token, domains, showLogout, filter) {
+// The /sent page: import and export sit together in the page head, the
+// search form sits at the top of the card, then the message list. Plain
+// HTML only — no inline script runs on this page.
+// view: { q, status, filtered, totalMatches, notice, importError } — the
+// last two carry the outcome shown after POST /sent/import.
+function renderSentPage(rows, token, domains, showLogout, view) {
+  const v = view || { q: "", status: "", filtered: false, totalMatches: null, notice: null, importError: "" };
   const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
-  const f = filter || { q: "", status: "", filtered: false, totalMatches: null };
-
-  // Header line: the match count when searching/filtering, the old
-  // "Last N messages" line otherwise.
-  const sub = f.filtered && f.totalMatches !== null
-    ? '<p class="sub">' + f.totalMatches + " match" + (f.totalMatches === 1 ? "" : "es") +
-      " across the whole archive" +
-      (f.totalMatches > rows.length ? " — showing the newest " + rows.length + "." : ".") +
-      "</p>"
-    : '<p class="sub">Last ' + rows.length + " message" + (rows.length === 1 ? "" : "s") +
-      " (most recent first).</p>";
-
-  // Plain-HTML GET form — the sent page stays script-free. The token rides
-  // along in a hidden field so AUTH_TOKEN-only setups keep working.
-  const filterForm =
-    '<form class="filter" method="get" action="/sent">' +
-    (token ? '<input type="hidden" name="token" value="' + escapeHtml(token) + '">' : "") +
-    '<input type="search" name="q" value="' + escapeHtml(f.q) +
-    '" placeholder="Search subject, body, addresses, error…" aria-label="Search sent messages">' +
-    '<select name="status" aria-label="Filter by status">' +
-    '<option value=""' + (f.status === "" ? " selected" : "") + ">All statuses</option>" +
-    '<option value="sent"' + (f.status === "sent" ? " selected" : "") + ">Sent</option>" +
-    '<option value="failed"' + (f.status === "failed" ? " selected" : "") + ">Failed</option>" +
-    "</select>" +
-    '<button type="submit" class="btn small">Search</button>' +
-    (f.filtered ? '<a class="btn ghost small" href="/sent' + tokenParam + '">Clear</a>' : "") +
-    "</form>";
 
   const items = rows.length
     ? rows
         .map(function (r) {
           const ok = r.status === "sent";
           const isHtml = r.content_type === "html";
+          const attCount = Number(r.attachment_count || 0);
+          const attPairs = [];
+          if (r.attachment_files) {
+            const parts = String(r.attachment_files).split("\u001f");
+            for (let i = 0; i + 2 < parts.length; i += 3) {
+              attPairs.push({ id: parts[i], name: parts[i + 1], size: Number(parts[i + 2]) });
+            }
+          }
+          const attLine = attPairs.length
+            ? '<p><strong>Attachments:</strong> ' +
+              attPairs
+                .map(function (a) {
+                  return '<a href="/attachments/' + encodeURIComponent(a.id) + tokenParam + '">' +
+                    escapeHtml(a.name) + "</a> <span class=\"muted\">(" + humanBytes(a.size) + ")</span>";
+                })
+                .join(", ") +
+              "</p>"
+            : "";
           return (
             '<details class="msg">' +
             "<summary>" +
@@ -2371,6 +2740,7 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
             "<strong>" + escapeHtml(r.subject || "") + "</strong>" +
             '<span class="meta">to ' + escapeHtml(r.to_addresses || "") +
             (isHtml ? " &middot; HTML" : "") +
+            (attCount ? " &middot; " + attCount + " attachment" + (attCount === 1 ? "" : "s") : "") +
             " &middot; " + escapeHtml(r.created_at || "") + " UTC</span>" +
             "</summary>" +
             '<div class="msg-body">' +
@@ -2380,6 +2750,7 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
             (r.reply_to ? "<p><strong>Reply-To:</strong> " + escapeHtml(r.reply_to) + "</p>" : "") +
             (r.resend_id ? "<p><strong>Resend ID:</strong> " + escapeHtml(r.resend_id) + "</p>" : "") +
             (r.delivery_status ? "<p><strong>Delivery:</strong> " + escapeHtml(r.delivery_status) + "</p>" : "") +
+            attLine +
             (!ok && r.error ? '<p class="err"><strong>Error:</strong> ' + escapeHtml(r.error) + "</p>" : "") +
             (isHtml
               ? '<iframe class="preview" sandbox="" srcdoc="' + escapeHtml(r.body || "") + '"></iframe>' +
@@ -2390,20 +2761,20 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
           );
         })
         .join("")
-    : '<p class="muted">' +
-      (f.filtered ? "No messages match this search." : "No messages sent yet.") +
-      "</p>";
+    : '<p class="muted">' + (v.filtered ? "No messages match this search." : "No messages sent yet.") + "</p>";
 
-  // Import lives in the head-row, right beside Export CSV, and there is no
-  // visible file field — no browser "No file chosen" box. The "Import CSV"
-  // label is the button: clicking it opens the native file picker directly,
-  // and choosing a file submits the form at once via a single inline
-  // onchange attribute (not a <script> block, so the page still carries no
-  // script of its own). The file input stays in the DOM, visually hidden
-  // but keyboard-focusable, so Tab + Enter opens the picker too. The token
-  // rides in the action URL, since a multipart upload cannot set the
-  // X-Auth-Token header. Only records identical to what is already
-  // archived are skipped; anything that differs is written.
+  const matches = v.totalMatches === null ? rows.length : v.totalMatches;
+  const sub = v.filtered
+    ? "Found " + matches + " matching message" + (matches === 1 ? "" : "s") +
+      (matches > rows.length ? " — showing the newest 200." : ".")
+    : "Last " + rows.length + " message" + (rows.length === 1 ? "" : "s") + " (most recent first).";
+
+  // Import lives right beside Export: the file input is visually hidden but
+  // stays keyboard-reachable (the button keeps the focus outline via
+  // :focus-within); clicking "Import CSV" opens the picker directly and
+  // picking a file submits the form at once — a single inline onchange
+  // attribute, so this page still ships no script block. The action carries
+  // ?token= because a multipart upload cannot send the X-Auth-Token header.
   const importForm =
     '<form class="import-form" method="post" action="/sent/import' + tokenParam + '" ' +
     'enctype="multipart/form-data">' +
@@ -2415,34 +2786,54 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
     "Import CSV</label>" +
     "</form>";
 
-  const content = `
-<div class="page-head">
-  <div class="head-row">
-    <div>
-      <h1>Sent messages</h1>
-      ${sub}
-    </div>
-    <div class="head-actions">
-      ${importForm}
-      <a class="btn ghost small" href="/sent/export${tokenParam}">Export CSV</a>
-    </div>
-  </div>
-</div>
-<div class="card">
- ${filterForm}
- ${items}
-</div>`;
+  const filterForm =
+    '<form class="filter-form" method="GET" action="/sent">' +
+    (token ? '<input type="hidden" name="token" value="' + escapeHtml(token) + '">' : "") +
+    '<input type="search" name="q" value="' + escapeHtml(v.q) + '" placeholder="Search subject, body, addresses, error..." aria-label="Search sent messages">' +
+    '<select name="status" aria-label="Filter by status">' +
+    '<option value=""' + (v.status === "" ? " selected" : "") + ">All</option>" +
+    '<option value="sent"' + (v.status === "sent" ? " selected" : "") + ">Sent</option>" +
+    '<option value="failed"' + (v.status === "failed" ? " selected" : "") + ">Failed</option>" +
+    "</select>" +
+    '<button type="submit" class="btn small">Search</button>' +
+    (v.filtered ? '<a class="btn ghost small" href="/sent' + tokenParam + '">Clear</a>' : "") +
+    "</form>";
+
+  let banner = "";
+  if (v.importError) {
+    banner =
+      '<div class="import-notice bad"><strong>Import failed:</strong> ' +
+      escapeHtml(v.importError) + "</div>";
+  } else if (v.notice) {
+    const n = v.notice;
+    const parts = [];
+    if (n.imported) parts.push(n.imported + " added");
+    if (n.skipped) parts.push(n.skipped + " duplicate" + (n.skipped === 1 ? "" : "s") + " skipped");
+    if (n.invalid) parts.push(n.invalid + " invalid");
+    banner =
+      '<div class="import-notice' + (n.invalid ? " bad" : "") + '"><strong>Import finished:</strong> ' +
+      escapeHtml(parts.length ? parts.join(", ") : "nothing to add") + "." +
+      (n.errs ? '<div class="reasons">' + escapeHtml(n.errs) + "</div>" : "") +
+      "</div>";
+  }
+
+  const content =
+    '<div class="page-head"><div class="head-row">' +
+    '<div><h1>Sent messages</h1><p class="sub">' + sub + "</p></div>" +
+    '<div class="head-actions">' +
+    importForm +
+    '<a class="btn ghost small" href="/sent/export' + tokenParam + '">Export CSV</a>' +
+    "</div></div></div>" +
+    '<div class="card">' +
+    banner +
+    filterForm +
+    items +
+    "</div>";
 
   const extraCss = `
-  .filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
-  .filter input[type="search"] { flex: 1 1 200px; width: auto; min-width: 0; }
-  .filter select { flex: 0 0 auto; width: auto; }
   .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
-  .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .import-form { display: flex; align-items: center; gap: 0; }
-  /* The file input is visually hidden but still focusable: keyboard users
-     tab to it and press Enter to open the picker, like any native input.
-     The label next to it acts as the Import button. */
   .import-form input[type="file"] {
     position: absolute;
     width: 1px;
@@ -2454,14 +2845,23 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
     white-space: nowrap;
     border: 0;
   }
-  .import-form label {
-    display: inline-block;
-    margin: 0;
+  .import-form label { display: inline-block; margin: 0; }
+  .import-form:focus-within label { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .msg-body a { color: var(--fg); font-weight: 600; }
+  .msg-body a:hover { color: var(--muted); }
+  .filter-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; }
+  .filter-form input[type="search"] { flex: 1 1 200px; min-width: 0; }
+  .filter-form select { flex: 0 0 auto; width: auto; cursor: pointer; }
+  .filter-form .btn { flex: none; }
+  .import-notice {
+    border: 1px solid var(--ok);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13.5px;
+    margin: 0 0 16px;
   }
-  .import-form:focus-within label {
-    outline: 2px solid var(--focus);
-    outline-offset: 2px;
-  }
+  .import-notice.bad { border-color: var(--err); }
+  .import-notice .reasons { color: var(--muted); font-size: 12.5px; margin-top: 4px; overflow-wrap: anywhere; }
   .msg { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .msg:last-of-type { border-bottom: none; }
   .msg summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -2510,58 +2910,7 @@ function renderSentPage(rows, token, domains, showLogout, filter) {
   });
 }
 
-// Result page for the CSV import: what was stored, what was skipped and
-// why, or the reason nothing was imported at all. Plain HTML — no script.
-function renderImportResult(r, token, domains, showLogout) {
-  const tokenParam = token ? "?token=" + encodeURIComponent(token) : "";
-  let body;
-  if (r.error) {
-    body =
-      '<div class="warn">' + escapeHtml(r.error) + "</div>" +
-      '<p class="muted">Nothing else was changed.</p>';
-  } else {
-    const invalid = r.invalid || [];
-    const notes = invalid
-      .slice(0, 5)
-      .map(function (n) { return "<li>" + escapeHtml(n) + "</li>"; })
-      .join("");
-    body =
-      (r.imported > 0
-        ? '<p class="ok-line">Imported ' + r.imported +
-          " message" + (r.imported === 1 ? "" : "s") + ".</p>"
-        : "<p>Nothing new to import — every valid row is identical to what is already in the archive.</p>") +
-      (r.skipped > 0
-        ? "<p>Skipped " + r.skipped + " row" + (r.skipped === 1 ? "" : "s") +
-          " identical to records already in the archive or repeated in the file — only one copy of each is kept.</p>"
-        : "") +
-      (invalid.length > 0
-        ? "<p>Ignored " + invalid.length + " invalid row" + (invalid.length === 1 ? "" : "s") + ":</p>" +
-          "<ul>" + notes + "</ul>" +
-          (invalid.length > 5 ? '<p class="muted">…and ' + (invalid.length - 5) + " more.</p>" : "")
-        : "");
-  }
-  const content =
-    '<div class="page-head"><h1>Import sent messages</h1>' +
-    '<p class="sub">From a CSV in the export format</p></div>' +
-    '<div class="card">' + body +
-    '<p class="back-link"><a class="btn ghost small" href="/sent' + tokenParam +
-    '">Back to sent messages</a></p>' +
-    "</div>";
-  return renderShell({
-    title: "Import — Outbox",
-    active: "sent",
-    token: token,
-    domains: domains,
-    showLogout: showLogout,
-    width: "narrow",
-    content: content,
-    extraCss:
-      ".ok-line { color: var(--ok); font-weight: 600; }\n" +
-      ".back-link { margin-top: 18px; }",
-  });
-}
-
-function renderUsagePage(stats, token, domains, showLogout) {
+function renderUsagePage(stats, token, domains, showLogout, storage) {
   const tokenJson = JSON.stringify(token || "").replace(/</g, "\\u003c");
 
   const isResend = stats.source === "resend";
@@ -2621,6 +2970,31 @@ function renderUsagePage(stats, token, domains, showLogout) {
     ? "Live from Resend"
     : "Local database stats (Resend was unreachable).";
 
+  // Storage meter: how much of the D1 database is still free. The used
+  // number is the real file size when D1 answers the introspection
+  // pragmas, otherwise the data estimate (attachments + message text).
+  let storageCard = "";
+  if (storage) {
+    const used = storage.dbBytes !== null ? storage.dbBytes : storage.attachmentBytes + storage.textBytes;
+    const pct = Math.max(0, Math.min(100, (used / storage.capBytes) * 100));
+    const free = Math.max(0, storage.capBytes - used);
+    const source = storage.dbBytes !== null
+      ? "the actual database file"
+      : "attachment bytes (" + humanBytes(storage.attachmentBytes) + ") plus message text (" + humanBytes(storage.textBytes) + ")";
+    storageCard =
+      '<div class="card storage-card">' +
+      "<h2>Database storage</h2>" +
+      '<div class="storage-line"><strong>' + humanBytes(used) + " used</strong> of " +
+      humanBytes(storage.capBytes) + " — <strong>" + humanBytes(free) + " free</strong></div>" +
+      '<div class="meter" role="img" aria-label="Database ' + Math.round(pct) + '% full">' +
+      '<div class="meter-fill' + (pct >= 90 ? " bad" : "") + '" style="width:' + Math.max(pct, 0.5) + '%"></div></div>' +
+      '<p class="muted">' + storage.files + " attachment" + (storage.files === 1 ? "" : "s") +
+      " stored. Measured from " + source +
+      ". D1 caps a single database at 10 GB (Workers Paid) or 500 MB (Free) — this meter assumes " +
+      humanBytes(storage.capBytes) + "; set a DB_CAP_MB var to match your plan.</p>" +
+      "</div>";
+  }
+
   const content =
     '<div class="page-head"><h1>API key usage</h1><p class="sub">' + sub + "</p></div>" +
     (stats.warning ? '<div class="warn">' + escapeHtml(stats.warning) + "</div>" : "") +
@@ -2643,7 +3017,8 @@ function renderUsagePage(stats, token, domains, showLogout) {
     "<h2>Top recipients</h2>" +
     topRec +
     "</div>" +
-    "</div>";
+    "</div>" +
+    storageCard;
 
   const extraCss = `
   .stat-grid {
@@ -2697,6 +3072,12 @@ function renderUsagePage(stats, token, domains, showLogout) {
   ol.top li::before { content: counter(rec); color: var(--muted); font-size: 12px; min-width: 14px; padding-top: 2px; }
 
   .sync-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+
+  .storage-card { margin-top: 16px; }
+  .storage-line { font-size: 14px; margin: 2px 0 10px; }
+  .meter { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
+  .meter-fill { height: 100%; background: var(--chart-bar); border-radius: 999px; }
+  .meter-fill.bad { background: var(--err); }
 `;
 
   const script = `<script>
@@ -2724,4 +3105,4 @@ function renderUsagePage(stats, token, domains, showLogout) {
     extraCss: extraCss,
     script: script,
   });
-    }
+}
