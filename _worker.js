@@ -16,10 +16,12 @@ const DEFAULT_DB_CAP_BYTES = 10 * 1024 * 1024 * 1024;  // D1 cap, Workers Paid (
 // Attachment summary per archived message, computed inside the /sent query:
 // the count for the list line, and id<US>filename<US>size triples (US =
 // char(31), a separator that cannot appear in real filenames' pairing) for
-// the expanded view.
+// the expanded view. GROUP_CONCAT needs the separator spelled out — with
+// the default it would join multiple attachments with commas and the
+// triples would fall apart.
 const ATTACHMENT_SUBSELECTS =
   "(SELECT COUNT(*) FROM attachments a WHERE a.email_id = emails.id) AS attachment_count, " +
-  "(SELECT COALESCE(GROUP_CONCAT(a.id || char(31) || a.filename || char(31) || a.size), '') " +
+  "(SELECT COALESCE(GROUP_CONCAT(a.id || char(31) || a.filename || char(31) || a.size, char(31)), '') " +
   "FROM attachments a WHERE a.email_id = emails.id) AS attachment_files ";
 
 // PASSWORD login sessions: 30-day signed cookies.
@@ -654,6 +656,41 @@ export default {
       await ensureSchema(env);
       const result = await syncDeliveryStatuses(env);
       return json({ success: true, checked: result.checked, byStatus: result.byStatus });
+    }
+
+    // Save (or clear) the database size limit shown on the Usage page.
+    // Written to the settings table — the meter reads it from there, no
+    // environment variable is involved.
+    if (request.method === "POST" && url.pathname === "/usage/cap") {
+      if (!(await isAuthorized(request, env))) {
+        return json({ success: false, error: "Unauthorized." }, 401);
+      }
+      if (!env.DB) {
+        return json({ success: false, error: "No D1 database is bound as DB." }, 500);
+      }
+      await ensureSchema(env);
+
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ success: false, error: "Request body must be valid JSON." }, 400);
+      }
+
+      const parsed = parseCapInput(body && body.cap);
+      if (parsed.error) return json({ success: false, error: parsed.error }, 400);
+
+      try {
+        await env.DB.prepare("DELETE FROM settings WHERE key = 'db_cap_mb'").run();
+        if (parsed.mb !== undefined) {
+          await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('db_cap_mb', ?)")
+            .bind(String(parsed.mb))
+            .run();
+        }
+      } catch (err) {
+        return json({ success: false, error: "Could not save the limit: " + err.message }, 500);
+      }
+      return json({ success: true, cap_mb: parsed.mb === undefined ? null : parsed.mb });
     }
 
     // Domain management page
@@ -1772,14 +1809,57 @@ async function syncDeliveryStatuses(env) {
 // message rows (column lengths plus a per-row overhead allowance). When D1
 // answers the page_count/page_size pragmas — not in its supported PRAGMA
 // list, so this can quietly fail — the real file size is shown instead.
+// The cap the meter divides by is the limit saved on the Usage page
+// (settings table); until one is saved the Workers Paid maximum is assumed.
+
+// Turns what the Size limit field contains into megabytes: "500 MB",
+// "10 GB", a bare number (megabytes). Empty means "back to the default".
+// Anything else is refused, with an example in the message.
+function parseCapInput(raw) {
+  const s = String(raw === undefined || raw === null ? "" : raw).trim().toLowerCase();
+  if (s === "") return { clear: true };
+  const m = /^([0-9]+(?:\.[0-9]+)?)\s*(kb|mb|gb)?$/.exec(s);
+  if (!m) {
+    return { error: 'Use a size like "500 MB" or "10 GB" — a number alone is megabytes.' };
+  }
+  let mb = Number(m[1]);
+  if (m[2] === "kb") mb /= 1024;
+  if (m[2] === "gb") mb *= 1024;
+  mb = Math.round(mb);
+  if (mb < 1) return { error: "The limit must be at least 1 MB." };
+  if (mb > 10240) {
+    return { error: "D1 caps a single database at 10 GB — the limit cannot be set higher." };
+  }
+  return { mb: mb };
+}
+
 async function getStorageInfo(env) {
-  const out = { files: 0, attachmentBytes: 0, textBytes: 0, dbBytes: null, capBytes: dbCapBytes(env) };
+  const out = {
+    files: 0,
+    attachmentBytes: 0,
+    textBytes: 0,
+    dbBytes: null,
+    capBytes: DEFAULT_DB_CAP_BYTES,
+    capIsDefault: true,
+  };
   try {
     const a = await env.DB.prepare(
       "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS b FROM attachments"
     ).first();
     out.files = (a && a.n) || 0;
     out.attachmentBytes = (a && a.b) || 0;
+  } catch {}
+  // The saved limit — the Size limit field writes it here as megabytes.
+  // Nothing stored (or an unreadable value) keeps the default cap.
+  try {
+    const c = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'db_cap_mb'"
+    ).first();
+    const mb = Number(c && c.value);
+    if (mb > 0) {
+      out.capBytes = mb * 1024 * 1024;
+      out.capIsDefault = false;
+    }
   } catch {}
   try {
     const t = await env.DB.prepare(
@@ -1801,14 +1881,6 @@ async function getStorageInfo(env) {
     if (pageCount > 0 && pageSize > 0) out.dbBytes = pageCount * pageSize;
   } catch {}
   return out;
-}
-
-// The cap the meter divides by: a DB_CAP_MB var can match the account's
-// plan (500 MB on the free plan); the default is D1's per-database cap on
-// Workers Paid.
-function dbCapBytes(env) {
-  const mb = Number(env && env.DB_CAP_MB);
-  return mb > 0 ? mb * 1024 * 1024 : DEFAULT_DB_CAP_BYTES;
 }
 
 // --- Pages: shared dashboard shell --------------------------------------
@@ -1833,7 +1905,7 @@ const ICON_SENT =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M22 12h-6l-2 3h-4l-2-3H2"/>' +
-  '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>';
+  '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24z"/></svg>';
 const ICON_USAGE =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -2329,7 +2401,11 @@ function renderPage(domains, token, showLogout) {
     <iframe id="preview-frame" class="preview-frame" sandbox="" hidden></iframe>
     <pre id="preview-text" class="preview-text" hidden></pre>
     <label for="attachments">Attachments</label>
-    <input id="attachments" type="file" multiple>
+    <div class="attach-row">
+      <input id="attachments" type="file" multiple aria-label="Files to attach">
+      <label for="attachments" class="btn ghost small">Add files</label>
+    </div>
+    <ul id="attachment-list" class="attach-list" hidden></ul>
     <div class="hint" id="attachment-hint">Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.</div>
     <button id="submit-btn" type="submit" class="btn block">Send email</button>
   </form>
@@ -2350,7 +2426,7 @@ function renderPage(domains, token, showLogout) {
     margin-top: 12px;
   }
   /* Rendered previews stay white in both themes: that is how the
-  recipient sees the message. */
+     recipient sees the message. */
   .preview-frame { height: 260px; display: block; background: #ffffff; }
   .preview-text {
     min-height: 150px;
@@ -2363,20 +2439,46 @@ function renderPage(domains, token, showLogout) {
     background: #ffffff;
   }
   #submit-btn { margin-top: 22px; }
-  #attachments { padding: 8px 10px; font-size: 13px; color: var(--muted); cursor: pointer; }
-  #attachments::file-selector-button {
-    font: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--fg);
-    background: var(--ghost-bg);
-    border: 1px solid var(--border-strong);
-    border-radius: 7px;
-    padding: 7px 12px;
-    margin: 0 10px 0 0;
-    cursor: pointer;
+  /* The picker is one button: the real input is visually hidden (but stays
+     keyboard-reachable — :focus-within moves the focus outline onto the
+     button), and every picked file is listed underneath with a Remove. */
+  .attach-row input[type="file"] {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
   }
-  #attachments::file-selector-button:hover { background: var(--ghost-hover); }
+  .attach-row label { display: inline-block; margin: 0; }
+  .attach-row:focus-within label { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .attach-list { list-style: none; margin: 10px 0 0; padding: 0; }
+  .attach-list li {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13.5px;
+  }
+  .attach-list li:last-child { border-bottom: none; }
+  .attach-list .att-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .attach-list .att-size { flex: none; color: var(--muted); }
+  .attach-list button {
+    flex: none;
+    border: none;
+    background: none;
+    color: var(--err);
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .attach-list button:hover { text-decoration: underline; }
   .hint.err { color: var(--err); }
 `;
 
@@ -2399,9 +2501,11 @@ function renderPage(domains, token, showLogout) {
   var previewing = false;
   var attInput = document.getElementById("attachments");
   var attHint = document.getElementById("attachment-hint");
+  var attList = document.getElementById("attachment-list");
   var ATT_MAX_FILES = 10;
   var ATT_MAX_FILE = 1572864;  /* 1.5 MB — kept in sync with the server */
   var ATT_MAX_TOTAL = 26214400; /* 25 MB */
+  var ATT_HINT = "Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.";
   var attProblem = "";
 
   function fmtSize(n) {
@@ -2411,14 +2515,50 @@ function renderPage(domains, token, showLogout) {
     return n + " B";
   }
 
+  // One row per picked file, each with its own Remove button. Rows are
+  // built with createElement/textContent — filenames are never trusted
+  // as HTML. Removing re-assigns input.files through a DataTransfer.
+  function renderAttachmentList(files) {
+    while (attList.firstChild) attList.removeChild(attList.firstChild);
+    for (var i = 0; i < files.length; i++) {
+      (function (idx, file) {
+        var li = document.createElement("li");
+        var name = document.createElement("span");
+        name.className = "att-name";
+        name.textContent = file.name;
+        var size = document.createElement("span");
+        size.className = "att-size";
+        size.textContent = fmtSize(file.size);
+        var rm = document.createElement("button");
+        rm.type = "button";
+        rm.textContent = "Remove";
+        rm.addEventListener("click", function () {
+          try {
+            var dt = new DataTransfer();
+            for (var j = 0; j < attInput.files.length; j++) {
+              if (j !== idx) dt.items.add(attInput.files[j]);
+            }
+            attInput.files = dt.files;
+          } catch (e) {
+            attInput.value = "";  // no DataTransfer: start over
+          }
+          checkAttachments();
+        });
+        li.appendChild(name);
+        li.appendChild(size);
+        li.appendChild(rm);
+        attList.appendChild(li);
+      })(i, files[i]);
+    }
+    attList.hidden = files.length === 0;
+  }
+
   function checkAttachments() {
     attProblem = "";
     var files = attInput.files;
     var total = 0;
-    var names = [];
     for (var i = 0; i < files.length; i++) {
       total += files[i].size;
-      names.push(files[i].name + " (" + fmtSize(files[i].size) + ")");
       if (files[i].size > ATT_MAX_FILE) {
         attProblem += (attProblem ? "; " : "") + files[i].name + " is over " + fmtSize(ATT_MAX_FILE);
       }
@@ -2429,12 +2569,14 @@ function renderPage(domains, token, showLogout) {
     if (total > ATT_MAX_TOTAL) {
       attProblem += (attProblem ? "; " : "") + "total over " + fmtSize(ATT_MAX_TOTAL);
     }
+    renderAttachmentList(files);
     if (!files.length) {
-      attHint.textContent = "Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.";
+      attHint.textContent = ATT_HINT;
       attHint.className = "hint";
       return;
     }
-    attHint.textContent = names.join(", ") + (attProblem ? " — " + attProblem : "");
+    attHint.textContent = files.length + " file" + (files.length === 1 ? "" : "s") + ", " +
+      fmtSize(total) + " total" + (attProblem ? " — " + attProblem : "");
     attHint.className = attProblem ? "hint err" : "hint";
   }
   attInput.addEventListener("change", checkAttachments);
@@ -2973,6 +3115,8 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
   // Storage meter: how much of the D1 database is still free. The used
   // number is the real file size when D1 answers the introspection
   // pragmas, otherwise the data estimate (attachments + message text).
+  // The limit it divides by is whatever was saved in the Size limit field
+  // below — stored in the settings table, not a variable.
   let storageCard = "";
   if (storage) {
     const used = storage.dbBytes !== null ? storage.dbBytes : storage.attachmentBytes + storage.textBytes;
@@ -2981,6 +3125,7 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
     const source = storage.dbBytes !== null
       ? "the actual database file"
       : "attachment bytes (" + humanBytes(storage.attachmentBytes) + ") plus message text (" + humanBytes(storage.textBytes) + ")";
+    const capMb = Math.round(storage.capBytes / 1048576);
     storageCard =
       '<div class="card storage-card">' +
       "<h2>Database storage</h2>" +
@@ -2989,9 +3134,20 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
       '<div class="meter" role="img" aria-label="Database ' + Math.round(pct) + '% full">' +
       '<div class="meter-fill' + (pct >= 90 ? " bad" : "") + '" style="width:' + Math.max(pct, 0.5) + '%"></div></div>' +
       '<p class="muted">' + storage.files + " attachment" + (storage.files === 1 ? "" : "s") +
-      " stored. Measured from " + source +
-      ". D1 caps a single database at 10 GB (Workers Paid) or 500 MB (Free) — this meter assumes " +
-      humanBytes(storage.capBytes) + "; set a DB_CAP_MB var to match your plan.</p>" +
+      " stored. Measured from " + source + ".</p>" +
+      '<div class="cap-form">' +
+      '<label for="db-cap">Size limit</label>' +
+      '<div class="cap-row">' +
+      '<input id="db-cap" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"' +
+      ' placeholder="e.g. 500 MB"' +
+      (storage.capIsDefault ? "" : ' value="' + capMb + ' MB"') + ">" +
+      '<button id="cap-btn" type="button" class="btn small">Save limit</button>' +
+      "</div>" +
+      '<p class="muted">The limit your D1 database has: 500 MB on the Free plan, 10 GB on Workers Paid. ' +
+      'Accepts MB or GB ("500 MB", "10 GB"); a number alone is megabytes. Saving an empty field goes ' +
+      "back to the default (" + humanBytes(DEFAULT_DB_CAP_BYTES) + ").</p>" +
+      '<div class="status" id="cap-status"></div>' +
+      "</div>" +
       "</div>";
   }
 
@@ -3078,6 +3234,13 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
   .meter { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
   .meter-fill { height: 100%; background: var(--chart-bar); border-radius: 999px; }
   .meter-fill.bad { background: var(--err); }
+
+  .cap-form { margin-top: 16px; }
+  .cap-form label { margin: 0 0 6px; }
+  .cap-row { display: flex; gap: 8px; }
+  .cap-row input { flex: 1; min-width: 0; }
+  .cap-row .btn { flex: none; }
+  .cap-form .status { margin-top: 8px; min-height: 0; }
 `;
 
   const script = `<script>
@@ -3091,6 +3254,45 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
       .then(function () { location.reload(); })
       .catch(function () { location.reload(); });
   });
+
+  // The Size limit field: saving stores the value in the settings table
+  // (as megabytes) and reloads so the meter re-renders with it; saving an
+  // empty field removes the stored limit.
+  var capInput = document.getElementById("db-cap");
+  var capBtn = document.getElementById("cap-btn");
+  var capStatus = document.getElementById("cap-status");
+  if (capBtn && capInput) {
+    capBtn.addEventListener("click", saveCap);
+    capInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); saveCap(); }
+    });
+  }
+
+  function saveCap() {
+    capBtn.disabled = true;
+    capBtn.textContent = "Saving...";
+    capStatus.textContent = "";
+    capStatus.className = "status";
+    fetch("/usage/cap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN },
+      body: JSON.stringify({ cap: capInput.value })
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data.success) { location.reload(); return; }
+        capBtn.disabled = false;
+        capBtn.textContent = "Save limit";
+        capStatus.textContent = "Error: " + (data.error || "Unknown error");
+        capStatus.className = "status error";
+      })
+      .catch(function (err) {
+        capBtn.disabled = false;
+        capBtn.textContent = "Save limit";
+        capStatus.textContent = "Error: " + err.message;
+        capStatus.className = "status error";
+      });
+  }
 })();
 </script>`;
 
@@ -3105,4 +3307,4 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
     extraCss: extraCss,
     script: script,
   });
-}
+  }
