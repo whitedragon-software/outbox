@@ -136,7 +136,7 @@ async function sessionHmacHex(env, message) {
 
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 16).slice(-2), 16) || parseInt(hex.substr(i * 2, 2), 16);
   return out;
 }
 
@@ -1905,7 +1905,7 @@ const ICON_SENT =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M22 12h-6l-2 3h-4l-2-3H2"/>' +
-  '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24z"/></svg>';
+  '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>';
 const ICON_USAGE =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -2506,7 +2506,12 @@ function renderPage(domains, token, showLogout) {
   var ATT_MAX_FILE = 1572864;  /* 1.5 MB — kept in sync with the server */
   var ATT_MAX_TOTAL = 26214400; /* 25 MB */
   var ATT_HINT = "Optional — up to 10 files, 1.5 MB each, 25 MB total. Archived with the message in D1 and sent via Resend.";
-  var attProblem = "";
+  // A file input replaces its whole selection on every pick, which is why
+  // a second pass used to cover the first. The list therefore lives in the
+  // "picked" array instead: every change ADDS to it and then clears the
+  // input, which also makes re-picking the very same file fire the next
+  // change.
+  var picked = [];
 
   function fmtSize(n) {
     if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
@@ -2515,71 +2520,83 @@ function renderPage(domains, token, showLogout) {
     return n + " B";
   }
 
+  function pickedBytes() {
+    var t = 0;
+    for (var i = 0; i < picked.length; i++) t += picked[i].size;
+    return t;
+  }
+
+  function sameFile(a, b) {
+    return a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+  }
+
   // One row per picked file, each with its own Remove button. Rows are
   // built with createElement/textContent — filenames are never trusted
-  // as HTML. Removing re-assigns input.files through a DataTransfer.
-  function renderAttachmentList(files) {
+  // as HTML.
+  function renderAttachmentList() {
     while (attList.firstChild) attList.removeChild(attList.firstChild);
-    for (var i = 0; i < files.length; i++) {
-      (function (idx, file) {
+    for (var i = 0; i < picked.length; i++) {
+      (function (idx) {
         var li = document.createElement("li");
         var name = document.createElement("span");
         name.className = "att-name";
-        name.textContent = file.name;
+        name.textContent = picked[idx].name;
         var size = document.createElement("span");
         size.className = "att-size";
-        size.textContent = fmtSize(file.size);
+        size.textContent = fmtSize(picked[idx].size);
         var rm = document.createElement("button");
         rm.type = "button";
         rm.textContent = "Remove";
         rm.addEventListener("click", function () {
-          try {
-            var dt = new DataTransfer();
-            for (var j = 0; j < attInput.files.length; j++) {
-              if (j !== idx) dt.items.add(attInput.files[j]);
-            }
-            attInput.files = dt.files;
-          } catch (e) {
-            attInput.value = "";  // no DataTransfer: start over
-          }
-          checkAttachments();
+          picked.splice(idx, 1);
+          showPicked("");
         });
         li.appendChild(name);
         li.appendChild(size);
         li.appendChild(rm);
         attList.appendChild(li);
-      })(i, files[i]);
+      })(i);
     }
-    attList.hidden = files.length === 0;
+    attList.hidden = picked.length === 0;
   }
 
-  function checkAttachments() {
-    attProblem = "";
-    var files = attInput.files;
-    var total = 0;
-    for (var i = 0; i < files.length; i++) {
-      total += files[i].size;
-      if (files[i].size > ATT_MAX_FILE) {
-        attProblem += (attProblem ? "; " : "") + files[i].name + " is over " + fmtSize(ATT_MAX_FILE);
-      }
-    }
-    if (files.length > ATT_MAX_FILES) {
-      attProblem += (attProblem ? "; " : "") + "at most " + ATT_MAX_FILES + " files";
-    }
-    if (total > ATT_MAX_TOTAL) {
-      attProblem += (attProblem ? "; " : "") + "total over " + fmtSize(ATT_MAX_TOTAL);
-    }
-    renderAttachmentList(files);
-    if (!files.length) {
-      attHint.textContent = ATT_HINT;
-      attHint.className = "hint";
+  // "N files, X total" — plus, when a pick had to refuse files, why.
+  function showPicked(refused) {
+    renderAttachmentList();
+    if (!picked.length) {
+      attHint.textContent = refused || ATT_HINT;
+      attHint.className = refused ? "hint err" : "hint";
       return;
     }
-    attHint.textContent = files.length + " file" + (files.length === 1 ? "" : "s") + ", " +
-      fmtSize(total) + " total" + (attProblem ? " — " + attProblem : "");
-    attHint.className = attProblem ? "hint err" : "hint";
+    attHint.textContent = picked.length + " file" + (picked.length === 1 ? "" : "s") + ", " +
+      fmtSize(pickedBytes()) + " total" + (refused ? " — " + refused : "");
+    attHint.className = refused ? "hint err" : "hint";
   }
-  attInput.addEventListener("change", checkAttachments);
+
+  attInput.addEventListener("change", function () {
+    var incoming = Array.prototype.slice.call(attInput.files);
+    attInput.value = "";  // reset now so any later pick fires a fresh change
+    var refused = [];
+    for (var i = 0; i < incoming.length; i++) {
+      var f = incoming[i];
+      var dup = false;
+      for (var j = 0; j < picked.length; j++) {
+        if (sameFile(picked[j], f)) { dup = true; break; }
+      }
+      if (dup) {
+        refused.push('"' + f.name + '" is already on the list');
+      } else if (f.size > ATT_MAX_FILE) {
+        refused.push('"' + f.name + '" is over ' + fmtSize(ATT_MAX_FILE) + " and was not added");
+      } else if (picked.length >= ATT_MAX_FILES) {
+        refused.push('"' + f.name + '" would exceed ' + ATT_MAX_FILES + " files and was not added");
+      } else if (pickedBytes() + f.size > ATT_MAX_TOTAL) {
+        refused.push('"' + f.name + '" would push the total over ' + fmtSize(ATT_MAX_TOTAL) + " and was not added");
+      } else {
+        picked.push(f);
+      }
+    }
+    showPicked(refused.length ? refused.join("; ") : "");
+  });
 
   function updatePreview() {
     var local = (localInput.value || "").trim().toLowerCase() || "noreply";
@@ -2628,9 +2645,8 @@ function renderPage(domains, token, showLogout) {
 
   form.addEventListener("submit", function (e) {
     e.preventDefault();
-    checkAttachments();
-    if (attProblem) {
-      statusBox.textContent = "Error: " + attProblem;
+    if (picked.length > ATT_MAX_FILES || pickedBytes() > ATT_MAX_TOTAL) {
+      statusBox.textContent = "Error: the attachment list breaks the caps — remove a file and try again.";
       statusBox.className = "status error";
       return;
     }
@@ -2649,8 +2665,8 @@ function renderPage(domains, token, showLogout) {
     fd.append("subject", document.getElementById("subject").value);
     if (domainSel) fd.append("from_domain", domainSel.value);
     fd.append(htmlBox.checked ? "html" : "text", messageBox.value);
-    for (var i = 0; i < attInput.files.length; i++) {
-      fd.append("attachments", attInput.files[i]);
+    for (var i = 0; i < picked.length; i++) {
+      fd.append("attachments", picked[i]);
     }
 
     fetch("/send", {
@@ -2667,8 +2683,9 @@ function renderPage(domains, token, showLogout) {
           statusBox.textContent = msg;
           statusBox.className = "status success";
           form.reset();
+          picked = [];
           attInput.value = "";
-          checkAttachments();
+          showPicked("");
           updatePreview();
           msgLabel.textContent = "Message";
           exitPreview();
@@ -2860,7 +2877,7 @@ function renderSentPage(rows, token, domains, showLogout, view) {
           const attCount = Number(r.attachment_count || 0);
           const attPairs = [];
           if (r.attachment_files) {
-            const parts = String(r.attachment_files).split("\u001f");
+            const parts = String(r.attachment_files).split("");
             for (let i = 0; i + 2 < parts.length; i += 3) {
               attPairs.push({ id: parts[i], name: parts[i + 1], size: Number(parts[i + 2]) });
             }
@@ -3121,6 +3138,7 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
   if (storage) {
     const used = storage.dbBytes !== null ? storage.dbBytes : storage.attachmentBytes + storage.textBytes;
     const pct = Math.max(0, Math.min(100, (used / storage.capBytes) * 100));
+    const pctText = pct >= 10 ? Math.round(pct) + "%" : pct.toFixed(1) + "%";
     const free = Math.max(0, storage.capBytes - used);
     const source = storage.dbBytes !== null
       ? "the actual database file"
@@ -3129,9 +3147,9 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
     storageCard =
       '<div class="card storage-card">' +
       "<h2>Database storage</h2>" +
-      '<div class="storage-line"><strong>' + humanBytes(used) + " used</strong> of " +
+      '<div class="storage-line"><strong>' + humanBytes(used) + " used</strong> (" + pctText + ") of " +
       humanBytes(storage.capBytes) + " — <strong>" + humanBytes(free) + " free</strong></div>" +
-      '<div class="meter" role="img" aria-label="Database ' + Math.round(pct) + '% full">' +
+      '<div class="meter" role="img" aria-label="Database ' + pctText + ' full">' +
       '<div class="meter-fill' + (pct >= 90 ? " bad" : "") + '" style="width:' + Math.max(pct, 0.5) + '%"></div></div>' +
       '<p class="muted">' + storage.files + " attachment" + (storage.files === 1 ? "" : "s") +
       " stored. Measured from " + source + ".</p>" +
@@ -3307,4 +3325,4 @@ function renderUsagePage(stats, token, domains, showLogout, storage) {
     extraCss: extraCss,
     script: script,
   });
-  }
+}
